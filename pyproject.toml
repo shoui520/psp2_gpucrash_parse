@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "psp2-gpucrash-parse"
+version = "0.6.0"
+description = "Structural parser and SGX543 register decoder for PS Vita GPUCRASH core dumps"
+requires-python = ">=3.9"
+license = {text = "MIT"}
+
+[project.scripts]
+psp2-gpucrash-parse = "psp2_gpucrash_parse.cli:main"
+
+[tool.setuptools]
+packages = ["psp2_gpucrash_parse"]
+
+[tool.setuptools.package-data]
+psp2_gpucrash_parse = ["data/*.json"]
