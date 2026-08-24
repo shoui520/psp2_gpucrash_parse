@@ -6,11 +6,11 @@ Parse a GPUCRASH dump:
 ./psp2-gpucrash-parse analyze dump.psp2dmp
 ```
 
-Use an original decrypted Vita ELF for additional CPU address analysis:
+Use an original Vita ELF or SELF for additional CPU address analysis:
 
 ```sh
 ./psp2-gpucrash-parse analyze dump.psp2dmp \
-  --elf application.elf \
+  --image application.self \
   --sdk /path/to/vitasdk
 ```
 

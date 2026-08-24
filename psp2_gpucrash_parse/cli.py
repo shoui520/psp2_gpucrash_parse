@@ -565,12 +565,12 @@ def _print_binary_images(diagnosis: dict) -> None:
         "nid_database_sources": [],
         "images": [],
     }
-    print("\nORIGINAL_ELF_IMAGES:")
+    print("\nORIGINAL_BINARY_IMAGES:")
     print(f"    Requested             : {binaries['requested_count']}")
     print(f"    Matched/rejected      : {binaries['matched_count']} / {binaries['rejected_count']}")
     print(f"    Invalid               : {binaries['invalid_count']}")
     if not binaries["images"]:
-        print("    No original ELF was supplied; runtime module+offset notation is retained.")
+        print("    No ELF or SELF was supplied; runtime module+offset notation is retained.")
         return
     print(f"    Objdump               : {binaries['objdump'] or '<unavailable>'}")
     print(f"    Addr2line             : {binaries['addr2line'] or '<unavailable>'}")
@@ -583,7 +583,20 @@ def _print_binary_images(diagnosis: dict) -> None:
         if image.get("status") == "invalid":
             print(f"        Status            : invalid ({image['error']})")
             continue
+        print(f"        Source format     : {image['source_format'].upper()}")
         print(f"        SHA-256           : {image['sha256']}")
+        print(
+            f"        Source/ELF size   : 0x{image['source_size']:x} / "
+            f"0x{image['reconstructed_elf_size']:x}"
+        )
+        if image["self_header"] is not None:
+            self_header = image["self_header"]
+            print(
+                f"        SELF version      : {self_header['version']} "
+                f"(SDK type=0x{self_header['sdk_type']:04x}, "
+                f"compressed={self_header['compressed_segment_count']}/"
+                f"{self_header['program_header_count']})"
+            )
         print(f"        ELF type/machine  : {_hex(image['elf_type'], 4)} / {image['machine']}")
         print(f"        Embedded module   : {image['module_name'] or '<unavailable>'}")
         if image["module_version"] is not None:
@@ -672,7 +685,7 @@ def _print_binary_images(diagnosis: dict) -> None:
                     f"({record['disassembly_error']})"
                 )
     print(
-        "    An ELF is associated only when its embedded Vita module name, "
+        "    An image is associated only when its embedded Vita module name, "
         "PT_LOAD permissions, and segment extents agree with MODULE_INFO."
     )
 
@@ -1375,8 +1388,8 @@ def command_analyze(args: argparse.Namespace) -> int:
     )
     if diagnosis is not None:
         diagnosis["binary_images"] = (
-            enrich_diagnosis_with_elfs(diagnosis, args.elf, args.sdk)
-            if args.elf
+            enrich_diagnosis_with_elfs(diagnosis, args.images, args.sdk)
+            if args.images
             else {
                 "requested_count": 0,
                 "matched_count": 0,
@@ -1398,23 +1411,23 @@ def command_analyze(args: argparse.Namespace) -> int:
             image["symbol_count"] == 0 for image in matched_images
         ):
             diagnosis["limitations"].append(
-                "Matched original ELF images are stripped. CPU bytes and SCE import "
+                "Matched binary images are stripped. CPU bytes and SCE import "
                 "NIDs are available; static function names and source lines are not."
             )
         if matched_images and binary_images["objdump"] is None:
             diagnosis["limitations"].append(
-                "Matched original ELF images are available, but Vita objdump was not found. "
+                "Matched binary images are available, but Vita objdump was not found. "
                 "Instruction disassembly was not produced."
             )
         if binary_images["rejected_count"]:
             diagnosis["limitations"].append(
-                f"{binary_images['rejected_count']} supplied ELF image(s) failed module "
+                f"{binary_images['rejected_count']} supplied binary image(s) failed module "
                 "identity or segment-layout checks and were not used."
             )
-        if not args.elf:
+        if not args.images:
             quoted = shlex.quote(str(core.path))
             diagnosis["recommended_commands"].append(
-                f"psp2-gpucrash-parse analyze {quoted} --elf ORIGINAL_MODULE.elf "
+                f"psp2-gpucrash-parse analyze {quoted} --image ORIGINAL_MODULE.elf "
                 "--sdk VITASDK"
             )
     result["diagnosis"] = diagnosis
@@ -1696,12 +1709,18 @@ def build_parser() -> argparse.ArgumentParser:
     )
     analyze.add_argument("dump", type=Path)
     analyze.add_argument(
+        "--image",
         "--elf",
+        "--self",
+        dest="images",
         action="append",
         default=[],
         type=Path,
         metavar="PATH",
-        help="original decrypted Vita ELF to match and use for address analysis (repeatable)",
+        help=(
+            "original Vita ELF, decrypted SELF, or fake SELF to use for address "
+            "analysis (repeatable)"
+        ),
     )
     analyze.add_argument(
         "--sdk",

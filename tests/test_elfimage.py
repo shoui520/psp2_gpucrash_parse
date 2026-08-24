@@ -1,9 +1,12 @@
+import hashlib
 import struct
 import tempfile
 import unittest
+import zlib
 from pathlib import Path
 from unittest.mock import patch
 
+from psp2_gpucrash_parse.core import ParseError
 from psp2_gpucrash_parse.elfimage import ElfImage, enrich_diagnosis_with_elfs
 
 
@@ -52,6 +55,48 @@ def _vita_elf(module_name: str = "TestModule") -> bytes:
     struct.pack_into("<10I", data, 0x350, 0, 3, 0, 0, 0x280, len(strings), 0, 0, 1, 0)
     struct.pack_into("<10I", data, 0x378, 0, 2, 0, 0, 0x2A0, 0x20, 2, 1, 4, 0x10)
     return bytes(data)
+
+
+def _vita_self(compressed: bool = True, encryption: int = 2) -> bytes:
+    elf = bytearray(_vita_elf())
+    struct.pack_into("<I", elf, 32, 0)
+    struct.pack_into("<HHH", elf, 46, 0, 0, 0)
+    phoff = struct.unpack_from("<I", elf, 28)[0]
+    phentsize, phnum = struct.unpack_from("<HH", elf, 42)
+    program_headers = elf[phoff : phoff + phentsize * phnum]
+
+    result = bytearray(0x1000)
+    result[:4] = b"SCE\0"
+    struct.pack_into("<IHHI", result, 4, 3, 0xC0, 1, 0x600)
+    struct.pack_into("<Q", result, 0x10, 0x1000)
+    struct.pack_into("<Q", result, 0x18, len(elf))
+    struct.pack_into("<Q", result, 0x40, 0xA0)
+    struct.pack_into("<Q", result, 0x48, 0xE0)
+    struct.pack_into("<Q", result, 0x58, 0x120)
+    result[0xA0 : 0xA0 + 52] = elf[:52]
+    result[0xE0 : 0xE0 + len(program_headers)] = program_headers
+
+    for index in range(phnum):
+        header = struct.unpack_from("<8I", program_headers, index * phentsize)
+        file_offset, file_size = header[1], header[4]
+        raw = bytes(elf[file_offset : file_offset + file_size])
+        payload = zlib.compress(raw, 9) if compressed else raw
+        payload_offset = (len(result) + 0xF) & ~0xF
+        result.extend(bytes(payload_offset - len(result)))
+        result.extend(payload)
+        padded_size = (len(payload) + 3) & ~3
+        result.extend(bytes(padded_size - len(payload)))
+        struct.pack_into(
+            "<4Q",
+            result,
+            0x120 + index * 0x20,
+            payload_offset,
+            padded_size,
+            2 if compressed else 1,
+            encryption,
+        )
+    struct.pack_into("<Q", result, 0x20, len(result))
+    return bytes(result)
 
 
 def _diagnosis() -> dict:
@@ -112,6 +157,42 @@ class ElfImageTests(unittest.TestCase):
         self.assertIsNotNone(symbol)
         self.assertEqual(symbol.name, "render_main")
         self.assertEqual(symbol.summary(0x81000018)["offset"], 8)
+
+    def test_parses_compressed_vita_self(self):
+        source = _vita_self(compressed=True)
+        image = ElfImage.parse(Path("test.self"), source)
+        self.assertEqual(image.source_format, "self")
+        self.assertEqual(image.sha256, hashlib.sha256(source).hexdigest())
+        self.assertEqual(image.module_name, "TestModule")
+        self.assertEqual(image.self_header["compressed_segment_count"], 2)
+        self.assertEqual(image.self_header["program_header_count"], 2)
+        self.assertEqual(image.summary()["reconstructed_elf_size"], 0x400)
+        self.assertEqual(image.symbols, ())
+        self.assertEqual(image.imports[0].library_name, "SceTest")
+
+    def test_parses_uncompressed_vita_self(self):
+        image = ElfImage.parse(Path("test.self"), _vita_self(compressed=False))
+        self.assertEqual(image.source_format, "self")
+        self.assertEqual(image.self_header["compressed_segment_count"], 0)
+        self.assertEqual(image.module_name, "TestModule")
+
+    def test_rejects_encrypted_vita_self(self):
+        with self.assertRaisesRegex(ParseError, "is encrypted"):
+            ElfImage.parse(Path("test.self"), _vita_self(encryption=1))
+
+    def test_matches_self_layout_and_enriches_runtime_pc(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "test.self"
+            path.write_bytes(_vita_self())
+            diagnosis = _diagnosis()
+            with patch("psp2_gpucrash_parse.elfimage.shutil.which", return_value=None):
+                result = enrich_diagnosis_with_elfs(diagnosis, [path])
+        self.assertEqual(result["matched_count"], 1)
+        self.assertEqual(result["invalid_count"], 0)
+        self.assertEqual(result["images"][0]["source_format"], "self")
+        location = diagnosis["execution_context"]["threads"][0]["pc_image"]
+        self.assertEqual(location["elf_virtual_address"], 0x81000018)
+        self.assertEqual(location["file_offset"], 0x118)
 
     def test_matches_layout_and_enriches_runtime_pc(self):
         with tempfile.TemporaryDirectory() as directory:

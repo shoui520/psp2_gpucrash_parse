@@ -7,6 +7,7 @@ import shutil
 import struct
 import subprocess
 import tempfile
+import zlib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
@@ -20,15 +21,209 @@ SHT_DYNSYM = 11
 STT_NOTYPE = 0
 STT_FUNC = 2
 VITA_ET_SCE_RELEXEC = 0xFE04
+SCE_SELF_MAGIC = b"SCE\0"
+SCE_SELF_HEADER_SIZE = 0x80
+SCE_SELF_SEGMENT_INFO_SIZE = 0x20
+SCE_SELF_PLAIN = 2
+SCE_SELF_UNCOMPRESSED = 1
+SCE_SELF_COMPRESSED = 2
+MAX_SELF_ELF_SIZE = 512 * 1024 * 1024
+MAX_SELF_SEGMENTS = 1024
 
 
 def _checked_slice(data: bytes, offset: int, size: int, description: str) -> bytes:
     if offset < 0 or size < 0 or offset + size > len(data):
         raise ParseError(
             f"{description} at 0x{offset:x}+0x{size:x} exceeds "
-            f"0x{len(data):x}-byte ELF"
+            f"0x{len(data):x}-byte image"
         )
     return data[offset : offset + size]
+
+
+def _decompress_self_segment(
+    path: Path, payload: bytes, expected_size: int, index: int
+) -> bytes:
+    decoder = zlib.decompressobj()
+    output = bytearray()
+    pending = payload
+    try:
+        while not decoder.eof:
+            limit = expected_size + 1 - len(output)
+            if limit <= 0:
+                raise ParseError(
+                    f"{path} SELF segment {index} expands beyond its "
+                    f"0x{expected_size:x}-byte ELF extent"
+                )
+            chunk = decoder.decompress(pending, limit)
+            output.extend(chunk)
+            pending = decoder.unconsumed_tail
+            if not pending and not decoder.eof:
+                break
+    except zlib.error as exc:
+        raise ParseError(
+            f"{path} SELF segment {index} has invalid zlib data: {exc}"
+        ) from exc
+    if not decoder.eof:
+        raise ParseError(f"{path} SELF segment {index} has truncated zlib data")
+    if len(output) != expected_size:
+        raise ParseError(
+            f"{path} SELF segment {index} expands to 0x{len(output):x} bytes; "
+            f"ELF program header requires 0x{expected_size:x}"
+        )
+    trailing = decoder.unused_data
+    if trailing and any(trailing):
+        raise ParseError(
+            f"{path} SELF segment {index} has non-padding data after its zlib stream"
+        )
+    return bytes(output)
+
+
+def _extract_vita_self(path: Path, source: bytes) -> Tuple[bytes, dict]:
+    if len(source) < SCE_SELF_HEADER_SIZE:
+        raise ParseError(f"{path} has a truncated Vita SELF header")
+    version = struct.unpack_from("<I", source, 4)[0]
+    sdk_type, header_type = struct.unpack_from("<HH", source, 8)
+    header_size = struct.unpack_from("<Q", source, 0x10)[0]
+    declared_elf_size = struct.unpack_from("<Q", source, 0x18)[0]
+    declared_self_size = struct.unpack_from("<Q", source, 0x20)[0]
+    elf_offset = struct.unpack_from("<Q", source, 0x40)[0]
+    phdr_offset = struct.unpack_from("<Q", source, 0x48)[0]
+    shdr_offset = struct.unpack_from("<Q", source, 0x50)[0]
+    segment_info_offset = struct.unpack_from("<Q", source, 0x58)[0]
+    if header_type != 1:
+        raise ParseError(
+            f"{path} is an SCE container type {header_type}, not a Vita SELF"
+        )
+    if declared_self_size and declared_self_size > len(source):
+        raise ParseError(
+            f"{path} SELF declares a 0x{declared_self_size:x}-byte file but only "
+            f"0x{len(source):x} bytes are available"
+        )
+
+    elf_header = _checked_slice(source, elf_offset, 52, "SELF embedded ELF header")
+    if elf_header[:4] != b"\x7fELF":
+        raise ParseError(f"{path} SELF has no ELF header at its declared offset")
+    if elf_header[4] != 1 or elf_header[5] != 1:
+        raise ParseError(f"{path} SELF does not contain a little-endian ELF32 image")
+    (
+        _elf_type,
+        _machine,
+        _elf_version,
+        _entry,
+        elf_phoff,
+        elf_shoff,
+        _flags,
+        elf_ehsize,
+        elf_phentsize,
+        elf_phnum,
+        elf_shentsize,
+        elf_shnum,
+        _shstrndx,
+    ) = struct.unpack_from("<HHIIIIIHHHHHH", elf_header, 16)
+    if elf_ehsize < 52:
+        raise ParseError(f"{path} SELF contains an invalid ELF header size")
+    if elf_phnum > MAX_SELF_SEGMENTS:
+        raise ParseError(
+            f"{path} SELF contains {elf_phnum} program headers; maximum is "
+            f"{MAX_SELF_SEGMENTS}"
+        )
+    if elf_phnum and elf_phentsize < 32:
+        raise ParseError(f"{path} SELF contains an invalid program-header size")
+    if elf_shnum and elf_shentsize < 40:
+        raise ParseError(f"{path} SELF contains an invalid section-header size")
+
+    program_headers = _checked_slice(
+        source,
+        phdr_offset,
+        elf_phnum * elf_phentsize,
+        "SELF program-header table",
+    )
+    segment_infos = _checked_slice(
+        source,
+        segment_info_offset,
+        elf_phnum * SCE_SELF_SEGMENT_INFO_SIZE,
+        "SELF segment-info table",
+    )
+    required_size = max(elf_ehsize, elf_phoff + len(program_headers))
+    headers = []
+    for index in range(elf_phnum):
+        header = struct.unpack_from("<8I", program_headers, index * elf_phentsize)
+        headers.append(header)
+        required_size = max(required_size, header[1] + header[4])
+    if elf_shnum:
+        required_size = max(required_size, elf_shoff + elf_shnum * elf_shentsize)
+    image_size = max(declared_elf_size, required_size)
+    if image_size > MAX_SELF_ELF_SIZE:
+        raise ParseError(
+            f"{path} SELF requires a 0x{image_size:x}-byte reconstructed ELF; "
+            f"maximum is 0x{MAX_SELF_ELF_SIZE:x}"
+        )
+    if declared_elf_size and required_size > declared_elf_size:
+        raise ParseError(
+            f"{path} SELF program headers exceed its declared ELF size "
+            f"0x{declared_elf_size:x}"
+        )
+
+    image = bytearray(image_size)
+    image[: len(elf_header)] = elf_header
+    image[elf_phoff : elf_phoff + len(program_headers)] = program_headers
+    if elf_shnum:
+        if not shdr_offset:
+            raise ParseError(
+                f"{path} SELF declares ELF section headers but provides no table offset"
+            )
+        section_headers = _checked_slice(
+            source,
+            shdr_offset,
+            elf_shnum * elf_shentsize,
+            "SELF section-header table",
+        )
+        image[elf_shoff : elf_shoff + len(section_headers)] = section_headers
+
+    compressed_count = 0
+    for index, header in enumerate(headers):
+        file_offset, file_size = header[1], header[4]
+        payload_offset, payload_size, compression, encryption = struct.unpack_from(
+            "<4Q", segment_infos, index * SCE_SELF_SEGMENT_INFO_SIZE
+        )
+        if encryption != SCE_SELF_PLAIN:
+            raise ParseError(
+                f"{path} SELF segment {index} is encrypted; only decrypted or "
+                "fake SELF images can be analyzed"
+            )
+        payload = _checked_slice(
+            source,
+            payload_offset,
+            payload_size,
+            f"SELF segment {index} payload",
+        )
+        if compression == SCE_SELF_UNCOMPRESSED:
+            if payload_size < file_size:
+                raise ParseError(
+                    f"{path} SELF segment {index} contains 0x{payload_size:x} bytes; "
+                    f"ELF program header requires 0x{file_size:x}"
+                )
+            segment = payload[:file_size]
+        elif compression == SCE_SELF_COMPRESSED:
+            compressed_count += 1
+            segment = _decompress_self_segment(path, payload, file_size, index)
+        else:
+            raise ParseError(
+                f"{path} SELF segment {index} has unsupported compression mode "
+                f"{compression}"
+            )
+        image[file_offset : file_offset + file_size] = segment
+
+    return bytes(image), {
+        "version": version,
+        "sdk_type": sdk_type,
+        "header_type": header_type,
+        "header_size": header_size,
+        "declared_elf_size": declared_elf_size,
+        "declared_self_size": declared_self_size,
+        "program_header_count": elf_phnum,
+        "compressed_segment_count": compressed_count,
+    }
 
 
 def _c_string(data: bytes, offset: int) -> str:
@@ -137,6 +332,9 @@ class ElfImage:
     path: Path
     data: bytes
     sha256: str
+    source_format: str
+    source_size: int
+    self_header: Optional[dict]
     elf_type: int
     machine: int
     entry: int
@@ -157,8 +355,15 @@ class ElfImage:
 
     @classmethod
     def parse(cls, path: Path, data: bytes) -> "ElfImage":
+        path = Path(path)
+        source = data
+        source_format = "elf"
+        self_header = None
+        if data[:4] == SCE_SELF_MAGIC:
+            data, self_header = _extract_vita_self(path, data)
+            source_format = "self"
         if len(data) < 52 or data[:4] != b"\x7fELF":
-            raise ParseError(f"{path} is not an ELF image")
+            raise ParseError(f"{path} is not an ELF or Vita SELF image")
         if data[4] != 1:
             raise ParseError(f"{path} is not ELF32")
         if data[5] != 1:
@@ -291,9 +496,12 @@ class ElfImage:
             else ()
         )
         return cls(
-            Path(path),
+            path,
             data,
-            hashlib.sha256(data).hexdigest(),
+            hashlib.sha256(source).hexdigest(),
+            source_format,
+            len(source),
+            self_header,
             elf_type,
             machine,
             entry,
@@ -331,6 +539,10 @@ class ElfImage:
         return {
             "path": str(self.path),
             "sha256": self.sha256,
+            "source_format": self.source_format,
+            "source_size": self.source_size,
+            "reconstructed_elf_size": len(self.data),
+            "self_header": self.self_header,
             "elf_type": self.elf_type,
             "machine": self.machine,
             "entry": self.entry,
