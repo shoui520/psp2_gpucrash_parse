@@ -1,17 +1,22 @@
 import struct
 import unittest
 
-from psp2_gpucrash_parse.gpu import GpuInfo, compare_gpu_info
+from psp2_gpucrash_parse.gpu import GpuInfo, GpuTrailer, compare_gpu_info
 from psp2_gpucrash_parse.registers import RegisterDatabase
 
 
-def fixture(master_fault=0, core_fault=(0, 0, 0, 0)):
-    header = [5, 0x10003, 0x3F, 0, 0, 0, 0, 0, 0, 0, 0, 4, 2, 2, 1]
+def fixture(
+    master_fault=0,
+    core_fault=(0, 0, 0, 0),
+    environment_words=(0, 0, 0, 0, 0, 0, 0, 0),
+    indexed_selector=7,
+):
+    header = [5, 0x10003, 0x3F, *environment_words, 4, 2, 2, 1]
     words = header[:]
     words += [0x4C04, 0x80000, 0x4C08, master_fault]
     words += [0x0C04, 0x80000, 0x80000, 0x80000, 0x80000]
     words += [0x0C08, *core_fault]
-    words += [7, 1, 2, 3, 4]
+    words += [indexed_selector, 1, 2, 3, 4]
     words += [0xDEADBEEF]
     return struct.pack(f"<{len(words)}I", *words)
 
@@ -33,10 +38,43 @@ class GpuInfoTests(unittest.TestCase):
         self.assertEqual(diagnosis["fault_sources"][0]["scope"], "core1")
         self.assertEqual(diagnosis["fault_sources"][0]["address"], 0x12345000)
 
+    def test_indexed_rows_expose_only_firmware_consumed_semantics(self):
+        database = RegisterDatabase()
+        known = GpuInfo.parse(fixture(indexed_selector=0x26)).summary(database)
+        row = known["indexed_state"][0]
+        self.assertTrue(row["consumer_interpreted"])
+        self.assertEqual(row["name"], "MTE draw number")
+        self.assertEqual(
+            known["indexed_state_interpretation"]["consumer_interpreted_rows"], 1
+        )
+
+        unknown = GpuInfo.parse(fixture(indexed_selector=7)).summary(database)
+        self.assertFalse(unknown["indexed_state"][0]["consumer_interpreted"])
+        self.assertIsNone(unknown["indexed_state"][0]["name"])
+
     def test_decodes_capture_bitmap(self):
         info = GpuInfo.parse(fixture())
         self.assertTrue(info.snapshot_status()["complete"])
         self.assertTrue(info.capture_sections()["context_owners"])
+
+    def test_decodes_capture_timestamp_and_hardware_clock_words(self):
+        environment = (
+            (8 << 16) | 2026,
+            (23 << 16) | 25,
+            (43 << 16) | 4,
+            291204,
+            0x42,
+            0x29,
+            0x29,
+            0x6F,
+        )
+        info = GpuInfo.parse(fixture(environment_words=environment))
+        timestamp = info.capture_timestamp()
+        self.assertTrue(timestamp["valid"])
+        self.assertEqual(timestamp["iso_local"], "2026-08-25T23:04:43.291204")
+        self.assertFalse(timestamp["timezone_known"])
+        self.assertEqual(info.hardware_clock_state()["soc_revision"], 0x42)
+        self.assertEqual(info.hardware_clock_state()["crossbar_clock_word"], 0x6F)
 
     def test_decodes_context_owner_trailer(self):
         data = bytearray(0xF8)
@@ -48,6 +86,18 @@ class GpuInfoTests(unittest.TestCase):
         self.assertEqual(trailer.context_owners[0].process_id, 0x10005)
         self.assertEqual(trailer.context_owners[0].process_name, "SceKernelProcess")
         self.assertEqual(trailer.context_slot_map[0][2], 0xFF)
+
+    def test_classifies_export_tail_as_producer_padding(self):
+        data = bytearray(0xF8 + 0x2D0)
+        struct.pack_into("<4I", data, 0xE8, 1, 2, 3, 4)
+        data[0xF8 + 8] = 0xA5
+        summary = GpuTrailer.parse(data).summary()
+        self.assertEqual(summary["producer_initialized_size"], 0x3130)
+        self.assertEqual(summary["producer_export_size"], 0x3400)
+        self.assertEqual(summary["producer_padding_size"], 0x2D0)
+        self.assertEqual(summary["producer_padding_nonzero_bytes"], 1)
+        self.assertTrue(summary["producer_padding_size_matches"])
+        self.assertEqual(summary["driver_state"][0]["source_object_offset"], 0x108)
 
     def test_compare_reports_changed_core_register(self):
         left = GpuInfo.parse(fixture())

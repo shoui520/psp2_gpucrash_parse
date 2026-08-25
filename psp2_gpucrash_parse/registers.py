@@ -16,6 +16,21 @@ class BitField:
     def value(self, register_value: int) -> int:
         return (register_value & self.mask) >> self.shift
 
+    @property
+    def is_address(self) -> bool:
+        if self.shift == 0 or self.name in {"MIN_ADDRESS", "MAX_ADDRESS"}:
+            return False
+        return (
+            self.name in {"ADDR", "ADDRESS"}
+            or self.name.endswith("_ADDR")
+            or self.name.endswith("_ADDRESS")
+            or self.name.endswith("_BASEADDR")
+        )
+
+    def address(self, register_value: int) -> int:
+        """Return an address field in its register-aligned representation."""
+        return register_value & self.mask
+
 
 @dataclass
 class RegisterDefinition:
@@ -25,7 +40,28 @@ class RegisterDefinition:
 
     @property
     def display_name(self) -> str:
-        return self.names[0] if self.names else f"REG_{self.offset:04X}"
+        if not self.names:
+            return f"REG_{self.offset:04X}"
+        # Header extraction also encounters field enumerants whose numeric
+        # value happens to equal a register offset.  Real register names are
+        # normally the shortest aliases at that offset; explicit enumerant
+        # markers make the distinction unambiguous where present.
+        def rank(item: tuple[int, str]) -> tuple[int, int, int]:
+            index, name = item
+            enumerant = any(
+                marker in name
+                for marker in (
+                    "_VALUE_",
+                    "_SIZE_UINT",
+                    "_NUM_ENTRIES",
+                    "_FAST_SCANDIR_",
+                    "_USE_PIPELINE_",
+                    "_ZERO_RETURN_",
+                )
+            )
+            return (int(enumerant), len(name), index)
+
+        return min(enumerate(self.names), key=rank)[1]
 
 
 class RegisterDatabase:
@@ -124,7 +160,38 @@ class RegisterDatabase:
                     database.load_register_data(path)
                 else:
                     database.load_header(path)
+        database._prune_shadowed_fields()
         return database
+
+    def _prune_shadowed_fields(self) -> None:
+        """Remove fields borrowed from longer register-name prefixes.
+
+        The original C headers describe both registers and their fields with
+        flat preprocessor names.  Without this pass, for example,
+        EUR_CR_MASTER_CORE incorrectly acquires all fields belonging to
+        EUR_CR_MASTER_CORE_ID and EUR_CR_MASTER_CORE_REVISION.
+        """
+        for target in (self.core, self.master):
+            register_names = {
+                name for definition in target.values() for name in definition.names
+            }
+            for definition in target.values():
+                shadow_prefixes = set()
+                for base_name in definition.names:
+                    prefix = base_name + "_"
+                    shadow_prefixes.update(
+                        candidate[len(prefix) :]
+                        for candidate in register_names
+                        if candidate.startswith(prefix)
+                    )
+                definition.fields = [
+                    item
+                    for item in definition.fields
+                    if not any(
+                        item.name == prefix or item.name.startswith(prefix + "_")
+                        for prefix in shadow_prefixes
+                    )
+                ]
 
     def load_register_data(self, path: Path) -> None:
         payload = json.loads(path.read_text(encoding="utf-8"))
@@ -209,8 +276,18 @@ def default_register_headers() -> List[Path]:
 def decoded_fields(definition: Optional[RegisterDefinition], value: int) -> List[dict]:
     if definition is None:
         return []
-    return [
-        {"name": item.name, "value": item.value(value), "mask": item.mask}
-        for item in definition.fields
-        if item.value(value) != 0
-    ]
+    result = []
+    for item in definition.fields:
+        field_value = item.value(value)
+        if field_value == 0:
+            continue
+        decoded = {
+            "name": item.name,
+            "value": field_value,
+            "mask": item.mask,
+            "shift": item.shift,
+        }
+        if item.is_address:
+            decoded["address"] = item.address(value)
+        result.append(decoded)
+    return result

@@ -2,15 +2,21 @@ from __future__ import annotations
 
 import hashlib
 import struct
+from datetime import datetime
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Sequence, Tuple
 
 from .core import ParseError
+from .indexed import INDEXED_SELECTOR_METADATA, indexed_selector_summary
 from .registers import RegisterDatabase, decoded_fields
 
 
 GPU_INFO_FORMAT_VERSION = 5
 GPU_INFO_KNOWN_CAPTURE_FLAGS = 0x3F
+GPU_REGISTER_DUMP_INITIALIZED_SIZE = 0x3130
+GPU_REGISTER_DUMP_EXPORT_SIZE = 0x3400
+GPU_INFO_OUTER_FORMAT_WORD_SIZE = 4
+GPU_DRIVER_STATE_OBJECT_OFFSETS = (0x108, 0x10C, 0x110, 0x114)
 
 _CAPTURE_SECTIONS = (
     (0x01, "master_registers"),
@@ -39,6 +45,26 @@ _BIF_REQUESTORS = (
     "Partial Render Management",
     "Shader Code Fetch",
     "PDS Program Fetch",
+)
+
+# Resource-oriented interpretation of the same hardware paths.  These do not
+# claim allocation ownership or read/write direction; neither is retained by
+# the BIF status fields.
+_BIF_REQUESTOR_DETAILS = (
+    ("reserved", "undetermined", "Reserved requestor bit; no memory-path identity is defined."),
+    ("texture-access", "texture or sampler resource", "Texture unit resource access."),
+    ("tile-accelerator", "tile accelerator data", "Tile accelerator data access."),
+    ("vdm-stream-index", "VDM control stream or index buffer", "VDM command-stream or index fetch."),
+    ("transfer", "transfer resource", "Transfer engine source, destination, or control resource; direction is not retained."),
+    ("color-surface", "color render target", "Fragment-processing color-surface write."),
+    ("hsr-context", "HSR context buffer", "Hidden-surface-removal context reload."),
+    ("fragment-parameter", "fragment parameter buffer", "Fragment interpolation parameter-buffer read."),
+    ("hsr-parameter", "HSR parameter buffer", "Hidden-surface-removal parameter-buffer read."),
+    ("depth-stencil-visibility", "depth, stencil, or visibility buffer", "Hidden-surface-removal depth/stencil/visibility access."),
+    ("data-cache", "PDS DMA or shader data", "Data-cache access; status does not distinguish PDS DMA from shader data."),
+    ("partial-render", "partial-render state or buffer", "Partial-render management access."),
+    ("shader-code", "USSE shader program", "Shader instruction fetch."),
+    ("pds-program", "PDS program", "PDS program fetch."),
 )
 
 # SceGpuCoredump likewise treats BIF_INT_STAT.FAULT_TYPE as three independent
@@ -125,12 +151,49 @@ class GpuTrailer:
         return cls(owners, slot_map, state, offset, data[offset:], data)
 
     def summary(self) -> dict:
+        expected_padding_size = (
+            GPU_REGISTER_DUMP_EXPORT_SIZE - GPU_REGISTER_DUMP_INITIALIZED_SIZE
+        )
+        driver_state = [
+            {
+                "word": index,
+                "source_object_offset": GPU_DRIVER_STATE_OBJECT_OFFSETS[index],
+                "value": value,
+            }
+            for index, value in enumerate(self.driver_state_words)
+        ]
         return {
             "size": len(self.raw),
             "sha256": hashlib.sha256(self.raw).hexdigest(),
             "context_owners": [owner.summary() for owner in self.context_owners],
             "context_slot_map": [list(row) for row in self.context_slot_map],
             "driver_state_words": list(self.driver_state_words),
+            "driver_state": driver_state,
+            "driver_state_provenance": (
+                "Words copied by the GPU_INFO producer from GPU driver object "
+                "offsets +0x108, +0x10c, +0x110, and +0x114; field semantics "
+                "are not established."
+            ),
+            "producer_initialized_size": GPU_REGISTER_DUMP_INITIALIZED_SIZE,
+            "producer_export_size": GPU_REGISTER_DUMP_EXPORT_SIZE,
+            "producer_padding_offset": GPU_REGISTER_DUMP_INITIALIZED_SIZE,
+            "gpu_info_padding_offset": (
+                GPU_INFO_OUTER_FORMAT_WORD_SIZE
+                + GPU_REGISTER_DUMP_INITIALIZED_SIZE
+            ),
+            "trailer_padding_offset": self.remainder_offset,
+            "producer_padding_size": len(self.remainder),
+            "producer_padding_expected_size": expected_padding_size,
+            "producer_padding_size_matches": len(self.remainder)
+            == expected_padding_size,
+            "producer_padding_nonzero_bytes": sum(byte != 0 for byte in self.remainder),
+            "producer_padding_sha256": hashlib.sha256(self.remainder).hexdigest(),
+            "producer_padding_semantics": (
+                "Outside the producer-initialized extent; retained as raw buffer "
+                "padding and excluded from GPU-state interpretation."
+            ),
+            # Compatibility names retained for JSON consumers predating the
+            # producer-size reconstruction.
             "remainder_offset": self.remainder_offset,
             "remainder_size": len(self.remainder),
             "remainder_sha256": hashlib.sha256(self.remainder).hexdigest(),
@@ -215,6 +278,42 @@ class GpuInfo:
     def capture_flags(self) -> int:
         return self.header_words[2]
 
+    def capture_timestamp(self) -> dict:
+        year = self.header_words[3] & 0xFFFF
+        month = (self.header_words[3] >> 16) & 0xFFFF
+        day = self.header_words[4] & 0xFFFF
+        hour = (self.header_words[4] >> 16) & 0xFFFF
+        minute = self.header_words[5] & 0xFFFF
+        second = (self.header_words[5] >> 16) & 0xFFFF
+        microsecond = self.header_words[6]
+        iso_local = None
+        try:
+            value = datetime(year, month, day, hour, minute, second, microsecond)
+            iso_local = value.isoformat(timespec="microseconds")
+        except ValueError:
+            pass
+        return {
+            "valid": iso_local is not None,
+            "iso_local": iso_local,
+            "timezone_known": False,
+            "year": year,
+            "month": month,
+            "day": day,
+            "hour": hour,
+            "minute": minute,
+            "second": second,
+            "microsecond": microsecond,
+            "packed_words": list(self.header_words[3:7]),
+        }
+
+    def hardware_clock_state(self) -> dict:
+        return {
+            "soc_revision": self.header_words[7],
+            "mp_clock_word": self.header_words[8],
+            "core_clock_word": self.header_words[9],
+            "crossbar_clock_word": self.header_words[10],
+        }
+
     def capture_sections(self) -> dict:
         return {
             name: bool(self.capture_flags & mask)
@@ -292,16 +391,32 @@ class GpuInfo:
         }
 
     def summary(self, database: RegisterDatabase, include_registers: bool = True) -> dict:
+        interpreted_selectors = [
+            item.offset
+            for item in self.indexed_state
+            if item.offset in INDEXED_SELECTOR_METADATA
+        ]
         result = {
             "format_version": self.format_version,
             "header_words": list(self.header_words),
             "register_dump_version": self.register_dump_version,
             "snapshot": self.snapshot_status(),
             "producer_words": list(self.header_words[3:11]),
+            "capture_timestamp": self.capture_timestamp(),
+            "hardware_clock_state": self.hardware_clock_state(),
             "core_count": self.core_count,
             "master_register_count": len(self.master_registers),
             "per_core_register_count": len(self.per_core_registers),
             "indexed_state_count": len(self.indexed_state),
+            "indexed_state_interpretation": {
+                "consumer_interpreted_rows": len(interpreted_selectors),
+                "unassigned_rows": len(self.indexed_state) - len(interpreted_selectors),
+                "consumer_interpreted_selectors": interpreted_selectors,
+                "qualification": (
+                    "Only selectors used by the firmware coredump formatter are "
+                    "named; remaining captured rows are retained without speculative labels."
+                ),
+            },
             "trailer_size": len(self.trailer),
             "trailer_sha256": hashlib.sha256(self.trailer).hexdigest(),
             "trailer": self.decoded_trailer().summary(),
@@ -315,7 +430,7 @@ class GpuInfo:
                 _core_summary(item, database) for item in self.per_core_registers
             ]
             result["indexed_state"] = [
-                {"index": item.offset, "values": list(item.values)}
+                indexed_selector_summary(item.offset, item.values)
                 for item in self.indexed_state
             ]
         return result
@@ -324,6 +439,17 @@ class GpuInfo:
 def _fault_source(scope: str, status: int, fault: int) -> dict:
     requestor = status & 0x3FFF
     fault_type = (status >> 16) & 0x7
+    requestor_details = [
+        {
+            "bit": bit,
+            "code": _BIF_REQUESTOR_DETAILS[bit][0],
+            "name": _BIF_REQUESTORS[bit],
+            "resource_class": _BIF_REQUESTOR_DETAILS[bit][1],
+            "interpretation": _BIF_REQUESTOR_DETAILS[bit][2],
+        }
+        for bit in range(len(_BIF_REQUESTORS))
+        if requestor & (1 << bit)
+    ]
     return {
         "scope": scope,
         "status": status,
@@ -331,11 +457,8 @@ def _fault_source(scope: str, status: int, fault: int) -> dict:
         "status_latched": bool(status & 0x00073FFF),
         "fault_register_nonzero": bool(fault),
         "requestor": requestor,
-        "requestor_names": [
-            name
-            for bit, name in enumerate(_BIF_REQUESTORS)
-            if requestor & (1 << bit)
-        ],
+        "requestor_names": [item["name"] for item in requestor_details],
+        "requestor_details": requestor_details,
         "fault_type": fault_type,
         "fault_conditions": [
             name
@@ -410,6 +533,11 @@ def compare_gpu_info(left: GpuInfo, right: GpuInfo, database: RegisterDatabase) 
     indexed_changes = [
         {
             "index": index,
+            "name": (
+                INDEXED_SELECTOR_METADATA[index]["name"]
+                if index in INDEXED_SELECTOR_METADATA
+                else None
+            ),
             "left": list(left_indexed.get(index, ())),
             "right": list(right_indexed.get(index, ())),
         }
