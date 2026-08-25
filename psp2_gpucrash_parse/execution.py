@@ -559,6 +559,15 @@ class ExecutionContext:
                     registers is not None
                     and any(segment.contains(registers.sp, 4) for segment in core.loads)
                 )
+                register_context_live = bool(
+                    registers is not None
+                    and thread.status_name not in ("dormant", "dead")
+                )
+                poison_register_count = (
+                    sum(value == 0xDEADBEEF for value in registers.gpr)
+                    if registers is not None
+                    else 0
+                )
                 item = {
                     "index": thread.index,
                     "uid": thread.uid,
@@ -594,13 +603,24 @@ class ExecutionContext:
                         if registers is not None
                         else None
                     ),
+                    "register_context_live": register_context_live,
+                    "register_context_qualification": (
+                        "saved scheduler context retained at dump capture"
+                        if register_context_live
+                        else (
+                            f"{thread.status_name} thread record; not a live execution context"
+                            if registers is not None
+                            else "register context unavailable"
+                        )
+                    ),
+                    "poison_register_count": poison_register_count,
                     "pc_location": pc_location.summary() if pc_location else None,
                     "lr_location": lr_location.summary() if lr_location else None,
                     "stack_captured_at_sp": stack_captured,
                     "stack_usage": stack.summary() if stack is not None else None,
                     "stack_return_candidates": (
                         self._stack_candidates(core, thread, registers)
-                        if registers is not None and stack_captured
+                        if register_context_live and stack_captured
                         else []
                     ),
                 }
@@ -609,6 +629,7 @@ class ExecutionContext:
             item
             for item in thread_summaries
             if item["pc_location"] is not None
+            and item["register_context_live"]
             and item["pc_location"]["module_name"] != "SceLibKernel"
         ]
         return {

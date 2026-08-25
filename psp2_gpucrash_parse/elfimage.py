@@ -12,7 +12,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
-from .core import ParseError
+from .core import CoreDump, ParseError
+from .execution import ExecutionContext
 
 
 PT_LOAD = 1
@@ -533,6 +534,59 @@ class ElfImage:
             and address - symbol.address <= 0x10000
         ]
         return max(zero_size, key=lambda item: item.address) if zero_size else None
+
+    def section_headers(self) -> Tuple[dict, ...]:
+        """Return bounded ELF section metadata from the reconstructed image."""
+        (
+            _elf_type,
+            _machine,
+            _version,
+            _entry,
+            _phoff,
+            shoff,
+            _flags,
+            _ehsize,
+            _phentsize,
+            _phnum,
+            shentsize,
+            shnum,
+            shstrndx,
+        ) = struct.unpack_from("<HHIIIIIHHHHHH", self.data, 16)
+        if not shnum:
+            return ()
+        raw_headers = []
+        for index in range(shnum):
+            raw = _checked_slice(
+                self.data,
+                shoff + index * shentsize,
+                shentsize,
+                "section header",
+            )
+            raw_headers.append(struct.unpack_from("<10I", raw))
+        strings = b""
+        if shstrndx < len(raw_headers):
+            header = raw_headers[shstrndx]
+            strings = _checked_slice(
+                self.data, header[4], header[5], "section-name string table"
+            )
+        result = []
+        for index, header in enumerate(raw_headers):
+            result.append(
+                {
+                    "index": index,
+                    "name": _c_string(strings, header[0]) if strings else "",
+                    "type": header[1],
+                    "flags": header[2],
+                    "address": header[3],
+                    "file_offset": header[4],
+                    "size": header[5],
+                    "link": header[6],
+                    "info": header[7],
+                    "alignment": header[8],
+                    "entry_size": header[9],
+                }
+            )
+        return tuple(result)
 
     def summary(self) -> dict:
         imported_function_count = sum(len(item.functions) for item in self.imports)
@@ -1072,7 +1126,7 @@ def enrich_diagnosis_with_elfs(
     address_records: Dict[Tuple[str, int, str], dict] = {}
     for thread in execution["threads"]:
         registers = thread["registers"]
-        if registers is None:
+        if registers is None or not thread.get("register_context_live", True):
             continue
         for role in ("pc", "lr"):
             runtime_location = thread[f"{role}_location"]
@@ -1179,4 +1233,103 @@ def enrich_diagnosis_with_elfs(
         "addr2line": addr2line,
         "nid_database_sources": nid_sources,
         "images": images,
+    }
+
+
+def enrich_address_with_elfs(
+    core: CoreDump,
+    address_report: dict,
+    paths: Sequence[Path],
+    sdk: Optional[Path] = None,
+) -> dict:
+    """Resolve one runtime address against identity-checked Vita images."""
+    objdump = _find_sdk_tool(sdk, "arm-vita-eabi-objdump")
+    addr2line = _find_sdk_tool(sdk, "arm-vita-eabi-addr2line")
+    nid_names, nid_sources = _load_nid_database(_sdk_root(sdk, objdump))
+    execution = ExecutionContext.parse(core).summary(core)
+    runtime_location = address_report.get("module")
+    runtime_address = address_report["address"]
+    images = []
+    resolutions = []
+    for path in paths:
+        try:
+            image = ElfImage.read(Path(path))
+        except (OSError, ParseError) as exc:
+            images.append(
+                {"path": str(path), "status": "invalid", "error": str(exc)}
+            )
+            continue
+        association = _match_image(image, execution["modules"])
+        image_record = {
+            "path": str(path),
+            "status": association["status"],
+            "association": association,
+            "module_name": image.module_name,
+            "sha256": image.sha256,
+        }
+        images.append(image_record)
+        if association["status"] != "matched" or runtime_location is None:
+            image_record["address_status"] = (
+                "address-not-in-module"
+                if runtime_location is None
+                else "image-rejected"
+            )
+            continue
+        if association["module_index"] != runtime_location["module_index"]:
+            image_record["address_status"] = "different-captured-module"
+            continue
+        import_libraries, imports_by_address = _import_report(image, nid_names)
+        location = _address_location(
+            image,
+            association,
+            runtime_location,
+            runtime_address,
+            imports_by_address,
+        )
+        if location is None:
+            image_record["address_status"] = "address-outside-image-extent"
+            continue
+        image_record["address_status"] = "resolved"
+        load = image.load_segments[location["segment_number"] - 1]
+        preferred = "thumb" if runtime_address & 1 else "arm"
+        instructions, error = _disassemble(
+            objdump, image, load, location["elf_virtual_address"], preferred
+        )
+        alternate_set = "arm" if preferred == "thumb" else "thumb"
+        alternate, alternate_error = _disassemble(
+            objdump, image, load, location["elf_virtual_address"], alternate_set
+        )
+        instruction_set = preferred
+        basis = "address bit 0"
+        if _disassembly_score(alternate, alternate_error) < _disassembly_score(
+            instructions, error
+        ):
+            instruction_set = alternate_set
+            basis = "instruction decoding"
+            instructions = alternate
+            error = alternate_error
+        resolutions.append(
+            {
+                "location": location,
+                "source": _source_location(
+                    addr2line, image, location["elf_virtual_address"]
+                ),
+                "instruction_set": instruction_set,
+                "instruction_set_basis": basis,
+                "disassembly": _annotate_import_targets(
+                    instructions, imports_by_address
+                ),
+                "disassembly_error": error,
+                "import_library_count": len(import_libraries),
+            }
+        )
+    return {
+        "requested_count": len(paths),
+        "matched_count": sum(item["status"] == "matched" for item in images),
+        "resolved_count": len(resolutions),
+        "objdump": objdump,
+        "addr2line": addr2line,
+        "nid_database_sources": nid_sources,
+        "images": images,
+        "resolutions": resolutions,
     }

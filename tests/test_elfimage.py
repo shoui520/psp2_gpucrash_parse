@@ -7,7 +7,11 @@ from pathlib import Path
 from unittest.mock import patch
 
 from psp2_gpucrash_parse.core import ParseError
-from psp2_gpucrash_parse.elfimage import ElfImage, enrich_diagnosis_with_elfs
+from psp2_gpucrash_parse.elfimage import (
+    ElfImage,
+    enrich_address_with_elfs,
+    enrich_diagnosis_with_elfs,
+)
 
 
 def _vita_elf(module_name: str = "TestModule") -> bytes:
@@ -146,6 +150,32 @@ def _diagnosis() -> dict:
 
 
 class ElfImageTests(unittest.TestCase):
+    def test_resolves_one_runtime_address_with_identity_checked_elf(self):
+        execution = _diagnosis()["execution_context"]
+
+        class ParsedExecution:
+            def summary(self, _core):
+                return execution
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "test.elf"
+            path.write_bytes(_vita_elf())
+            report = {
+                "address": 0x82000018,
+                "module": execution["threads"][0]["pc_location"],
+            }
+            with patch(
+                "psp2_gpucrash_parse.elfimage.ExecutionContext.parse",
+                return_value=ParsedExecution(),
+            ):
+                result = enrich_address_with_elfs(object(), report, [path])
+        self.assertEqual(result["matched_count"], 1)
+        self.assertEqual(result["resolved_count"], 1)
+        self.assertEqual(
+            result["resolutions"][0]["location"]["symbol"]["name"],
+            "render_main",
+        )
+
     def test_parses_vita_module_identity_loads_and_symbols(self):
         image = ElfImage.parse(Path("test.elf"), _vita_elf())
         self.assertEqual(image.module_name, "TestModule")
