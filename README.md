@@ -23,8 +23,26 @@ Write the complete analysis as JSON:
 Other basic commands:
 
 ```sh
+./psp2-gpucrash-parse address dump.psp2dmp 0x70000000
+./psp2-gpucrash-parse xref dump.psp2dmp 0x70000000
+./psp2-gpucrash-parse map dump.psp2dmp
+./psp2-gpucrash-parse modules dump.psp2dmp
+./psp2-gpucrash-parse module dump.psp2dmp SceGxm
+./psp2-gpucrash-parse threads dump.psp2dmp
+./psp2-gpucrash-parse thread dump.psp2dmp 0x40010001
+./psp2-gpucrash-parse waits dump.psp2dmp
+./psp2-gpucrash-parse object dump.psp2dmp 0x40010002
+./psp2-gpucrash-parse search dump.psp2dmp --pointers-to 0x70000000
+./psp2-gpucrash-parse gpu faults dump.psp2dmp
+./psp2-gpucrash-parse gpu contexts dump.psp2dmp
+./psp2-gpucrash-parse gpu pipeline dump.psp2dmp
+./psp2-gpucrash-parse gpu resources dump.psp2dmp
 ./psp2-gpucrash-parse registers dump.psp2dmp
 ./psp2-gpucrash-parse segments dump.psp2dmp
 ./psp2-gpucrash-parse tty dump.psp2dmp
+./psp2-gpucrash-parse validate dump.psp2dmp
 ./psp2-gpucrash-parse compare first.psp2dmp second.psp2dmp
+./psp2-gpucrash-parse triage *.psp2dmp
 ```
+
+Add `--json` to query commands for machine-readable output.
