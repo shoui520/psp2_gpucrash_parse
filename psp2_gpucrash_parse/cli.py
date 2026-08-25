@@ -5,19 +5,40 @@ import hashlib
 import json
 import re
 import shlex
+import struct
 import sys
 from pathlib import Path
-from typing import Iterable, Optional
+from typing import Iterable, Optional, Sequence
 
 from . import __version__
 from .activity import GpuActivityInfo
 from .core import CoreDump, ParseError
+from .debugger import (
+    address_report,
+    compare_debug_state,
+    load_debug_state,
+    search_memory,
+    thread_detail_report,
+    thread_list_report,
+)
 from .diagnosis import build_diagnosis
-from .elfimage import enrich_diagnosis_with_elfs
+from .elfimage import enrich_address_with_elfs, enrich_diagnosis_with_elfs
 from .gpu import GpuInfo, compare_gpu_info
+from .indexed import indexed_selector_metadata
+from .inspection import (
+    annotated_stack,
+    module_report,
+    modules_report,
+    retained_map,
+    xref_report,
+)
 from .metadata import SummaryInfo
 from .registers import RegisterDatabase, decoded_fields
+from .triage import triage_dumps
 from .tty import TtyInfo
+from .unwind import unwind_thread
+from .validation import validate_core
+from .waitgraph import object_report, wait_graph
 
 
 def _number(value: str) -> int:
@@ -60,6 +81,38 @@ def _hexdump(data: bytes, address: int) -> str:
     return "\n".join(lines)
 
 
+def _classification_text(items: Sequence[dict]) -> str:
+    labels = []
+    for item in items:
+        kind = item["kind"]
+        if kind == "module-address":
+            labels.append(item["notation"])
+        elif kind == "memory-block-pointer":
+            labels.append(
+                f"mem:{item['name'] or '<unnamed>'}+0x{item['offset']:x}"
+            )
+        elif kind == "thread-stack-pointer":
+            owner = item["thread_name"] or f"0x{item['thread_uid']:08x}"
+            labels.append(
+                f"stack:{owner}+0x{item['offset']:x}"
+            )
+        elif kind == "thread-uid":
+            labels.append(f"thread-uid:{item['thread_name'] or '<unnamed>'}")
+        elif kind == "kernel-object-uid":
+            labels.append(
+                f"{item['object_kind']}-uid:{item['name'] or '<unnamed>'}"
+            )
+        elif kind == "gpu-resource-address":
+            labels.append(f"gpu:{item['name']}")
+        elif kind == "gpu-fault-page":
+            labels.append(f"fault-page+0x{item['offset']:x}")
+        elif kind != "captured-address":
+            labels.append(kind)
+    if not labels and any(item["kind"] == "captured-address" for item in items):
+        labels.append("captured")
+    return ", ".join(labels)
+
+
 def _print_analysis_banner() -> None:
     border = "*" * 79
     print(border)
@@ -67,7 +120,7 @@ def _print_analysis_banner() -> None:
     print(border)
 
 
-def _print_key_values(
+def _print_analysis_summary(
     core: CoreDump, info: GpuInfo, diagnosis: dict
 ) -> None:
     memory = diagnosis["memory_evidence"]
@@ -82,60 +135,109 @@ def _print_key_values(
     budgets = support["budgets"] or {}
     event_log = support["event_log"] or {}
     binary_images = diagnosis.get("binary_images") or {}
+    validation = diagnosis.get("validation") or {}
+    waits = diagnosis.get("wait_graph") or {}
     process = execution["process"] or {}
-    values = [
-        ("Analysis.Version", __version__),
-        ("Analysis.Code", diagnosis["analysis_code"]),
-        ("Analysis.Confidence", diagnosis["confidence"]),
-        ("Dump.ImageBytes", f"0x{core.image_size:x}"),
-        ("Dump.NoteCount", len(core.notes)),
-        ("Dump.LoadSegments", len(core.loads)),
-        ("Dump.UniqueLoadSegments", memory["unique_load_segment_count"]),
-        ("GPU.CoreCount", info.core_count),
-        ("GPU.Registers.Master", len(info.master_registers)),
-        ("GPU.Registers.PerCore", len(info.per_core_registers)),
-        ("GPU.Registers.Indexed", len(info.indexed_state)),
-        ("GPU.CaptureFlags", _hex(info.capture_flags)),
-        ("GPU.Snapshot.Complete", str(diagnosis["snapshot"]["complete"]).lower()),
-        ("GPU.FaultCount", len(diagnosis["fault_sources"])),
-        ("GPU.ErrorSignalCount", len(diagnosis["event_signals"])),
-        ("GPU.LockupPhaseCount", len(diagnosis["lockup_phases"])),
-        ("GPU.ActiveCoreCount", pipeline["active_core_count"]),
-        ("GPU.PhaseActiveUnitCount", pipeline["phase_active_unit_count"]),
-        ("GPU.LowActiveUnitCount", pipeline["active_unit_count"]),
-        ("GPU.ContextOwnerCount", len(diagnosis["context_owners"])),
-        ("GPU.ActivityState", diagnosis["activity_state"]),
-        ("TTY.LineCount", diagnosis["log"]["line_count"]),
-        ("Application.TitleId", application.get("title_id", "unavailable")),
-        ("Application.Title", application.get("title_name", "unavailable")),
-        ("ExternalProcesses.Count", external_processes.get("decoded_count", 0)),
-        ("Process.Name", process.get("process_name", "unavailable")),
-        ("Process.Id", _hex(process.get("process_id"))),
-        ("CPU.ThreadCount", execution["thread_count"]),
+    timestamp = info.capture_timestamp()
+    groups = [
         (
-            "CPU.NonKernelExecutionThreads",
-            len(execution["non_kernel_execution_thread_indices"]),
+            "Analysis",
+            [
+                ("Analyzer version", __version__),
+                ("Analysis code", diagnosis["analysis_code"]),
+                (
+                    "Classification confidence",
+                    diagnosis["classification_confidence"],
+                ),
+                ("Root-cause confidence", diagnosis["root_cause_confidence"]),
+                ("Fixed-format validation", validation.get("status", "not-run")),
+            ],
         ),
         (
-            "CPU.ModuleCount",
-            (execution["modules"] or {}).get("module_count", 0),
+            "Dump image",
+            [
+                ("Image size", f"0x{core.image_size:x} ({core.image_size} bytes)"),
+                ("Notes", len(core.notes)),
+                ("Load segments", len(core.loads)),
+                ("Unique load segments", memory["unique_load_segment_count"]),
+            ],
         ),
-        ("Kernel.ObjectCount", kernel["object_count"]),
-        ("Kernel.ActiveObjectCount", kernel["active_object_count"]),
-        ("Kernel.ResolvedThreadWaits", kernel["resolved_thread_wait_count"]),
-        ("Libraries.Count", libraries.get("decoded_name_count", 0)),
-        ("MemoryBudget.PartitionCount", budgets.get("partition_count", 0)),
-        ("SystemEventLog.RecordCount", event_log.get("record_count", 0)),
-        ("OriginalElf.Requested", binary_images.get("requested_count", 0)),
-        ("OriginalElf.Matched", binary_images.get("matched_count", 0)),
-        ("OriginalElf.Rejected", binary_images.get("rejected_count", 0)),
+        (
+            "GPU capture",
+            [
+                (
+                    "Capture time",
+                    (timestamp["iso_local"] + " (local; timezone not retained)")
+                    if timestamp["iso_local"]
+                    else "unavailable",
+                ),
+                ("Capture flags", _hex(info.capture_flags)),
+                (
+                    "Snapshot complete",
+                    "yes" if diagnosis["snapshot"]["complete"] else "no",
+                ),
+                ("GPU cores", info.core_count),
+                ("Master registers", len(info.master_registers)),
+                ("Per-core registers", len(info.per_core_registers)),
+                ("Indexed-state entries", len(info.indexed_state)),
+                ("Fault records", len(diagnosis["fault_sources"])),
+                ("Fault groups", len(diagnosis["fault_groups"])),
+                ("Error signals", len(diagnosis["event_signals"])),
+                ("Lockup phases", len(diagnosis["lockup_phases"])),
+                ("Active cores", pipeline["active_core_count"]),
+                ("Phase-active units", pipeline["phase_active_unit_count"]),
+                ("Low-level active units", pipeline["active_unit_count"]),
+                ("Context owners", len(diagnosis["context_owners"])),
+                ("Activity state", diagnosis["activity_state"]),
+            ],
+        ),
+        (
+            "Application and process",
+            [
+                ("Title ID", application.get("title_id") or "unavailable"),
+                ("Title", application.get("title_name") or "unavailable"),
+                ("External processes", external_processes.get("decoded_count", 0)),
+                ("Process", process.get("process_name") or "unavailable"),
+                ("Process ID", _hex(process.get("process_id"))),
+                ("Threads", execution["thread_count"]),
+                (
+                    "Non-kernel execution threads",
+                    len(execution["non_kernel_execution_thread_indices"]),
+                ),
+                ("Modules", (execution["modules"] or {}).get("module_count", 0)),
+            ],
+        ),
+        (
+            "Captured support data",
+            [
+                ("Kernel objects", kernel["object_count"]),
+                ("Active kernel objects", kernel["active_object_count"]),
+                ("Resolved thread waits", kernel["resolved_thread_wait_count"]),
+                ("Wait dependency edges", waits.get("edge_count", 0)),
+                ("Wait dependency cycles", waits.get("cycle_count", 0)),
+                ("TTY lines", diagnosis["log"]["line_count"]),
+                ("Libraries", libraries.get("decoded_name_count", 0)),
+                ("Memory-budget partitions", budgets.get("partition_count", 0)),
+                ("System event records", event_log.get("record_count", 0)),
+            ],
+        ),
+        (
+            "Original binary images",
+            [
+                ("Requested", binary_images.get("requested_count", 0)),
+                ("Matched", binary_images.get("matched_count", 0)),
+                ("Rejected", binary_images.get("rejected_count", 0)),
+            ],
+        ),
     ]
     if summary is not None:
-        values.append(("Dump.SummaryIncomplete", summary["incomplete_count"]))
-    print("KEY_VALUES_STRING: 1\n")
-    for key, value in values:
-        print(f"    Key  : {key}")
-        print(f"    Value: {value}")
+        groups[1][1].append(("Incomplete summary records", summary["incomplete_count"]))
+    print("GPUCRASH analysis summary:")
+    for index, (group_name, values) in enumerate(groups):
+        if index:
+            print(f"\n{group_name}:")
+        for name, value in values:
+            print(f"{name}: {value}")
 
 
 def _print_dump_attributes(core: CoreDump) -> None:
@@ -472,6 +574,10 @@ def _print_execution_context(diagnosis: dict) -> None:
             print("          register context unavailable")
             continue
         print(
+            f"          context={thread['register_context_qualification']} "
+            f"poison-registers={thread['poison_register_count']}/16"
+        )
+        print(
             f"          PC={_location_text(thread['pc_location'], registers['pc'])}"
         )
         if thread.get("pc_image") is not None:
@@ -505,14 +611,23 @@ def _print_execution_context(diagnosis: dict) -> None:
 
     selected_indices = set(execution["non_kernel_execution_thread_indices"])
     selected_indices.update(
-        thread["index"] for thread in threads if thread["name"] == "SceGxmDisplayQueue"
+        thread["index"]
+        for thread in threads
+        if thread["name"] == "SceGxmDisplayQueue"
+        and thread["register_context_live"]
     )
     selected = [thread for thread in threads if thread["index"] in selected_indices]
     print("\nCPU_REGISTER_CONTEXT_SELECTED:")
     if not selected:
-        print("    No thread is executing outside SceLibKernel and no GXM display thread exists.")
+        print(
+            "    No live saved context has a PC outside SceLibKernel, and no "
+            "live SceGxmDisplayQueue context exists."
+        )
     else:
-        print("    Selection: non-SceLibKernel PC or SceGxmDisplayQueue thread.")
+        print(
+            "    Selection: live saved context with a non-SceLibKernel PC, "
+            "or live SceGxmDisplayQueue context."
+        )
     for thread in selected:
         registers = thread["registers"]
         if registers is None:
@@ -755,6 +870,19 @@ def _print_kernel_objects(diagnosis: dict) -> None:
             f"waiter-record={str(thread['waiter_record_present']).lower()}"
         )
 
+    wait_graph_report = diagnosis.get("wait_graph") or {}
+    cycles = wait_graph_report.get("cycles", [])
+    if cycles:
+        print("\nCAPTURED_WAIT_DEPENDENCY_CYCLES:")
+        for cycle in cycles:
+            labels = [
+                node.get("name") or node["id"] for node in cycle["path"]
+            ]
+            print("    " + " -> ".join(labels))
+    elif wait_graph_report:
+        print("\nCAPTURED_WAIT_DEPENDENCY_CYCLES:")
+        print("    None in retained wait and mutex-owner fields.")
+
     locks = [
         item
         for item in kernel["active_objects"]
@@ -805,6 +933,13 @@ def _print_gpu_info(info: GpuInfo, database: RegisterDatabase) -> None:
     snapshot = info.snapshot_status()
     captured = [name for name, present in snapshot["sections"].items() if present]
     trailer = info.decoded_trailer()
+    trailer_summary = trailer.summary()
+    interpreted_selectors = sum(
+        indexed_selector_metadata(item.offset) is not None
+        for item in info.indexed_state
+    )
+    timestamp = info.capture_timestamp()
+    clock_state = info.hardware_clock_state()
     print("\nGPU_INFO:")
     print(f"    Format version        : {info.format_version}")
     print(f"    Register dump version : {_hex(info.register_dump_version)}")
@@ -819,12 +954,52 @@ def _print_gpu_info(info: GpuInfo, database: RegisterDatabase) -> None:
         f"    Register rows         : master={len(info.master_registers)} "
         f"per-core={len(info.per_core_registers)} indexed={len(info.indexed_state)}"
     )
+    print(
+        "    Indexed row semantics : "
+        f"{interpreted_selectors} firmware-consumed, "
+        f"{len(info.indexed_state) - interpreted_selectors} unassigned"
+    )
     print(f"    Captured sections     : {', '.join(captured) or 'none'}")
+    if timestamp["valid"]:
+        print(
+            f"    Capture local time    : {timestamp['iso_local']} "
+            "(timezone not retained)"
+        )
+    else:
+        print("    Capture local time    : invalid or unavailable")
+    print(f"    SoC revision word     : {_hex(clock_state['soc_revision'])}")
+    print(
+        "    Clock state words     : "
+        f"MP={_hex(clock_state['mp_clock_word'])} "
+        f"core={_hex(clock_state['core_clock_word'])} "
+        f"crossbar={_hex(clock_state['crossbar_clock_word'])}"
+    )
     print("    Header words          : " + " ".join(f"{word:08x}" for word in info.header_words))
-    print("    Producer words 3-10   : " + " ".join(f"{word:08x}" for word in info.header_words[3:11]))
+    print("    Time/environment words: " + " ".join(f"{word:08x}" for word in info.header_words[3:11]))
     print(f"    Trailer               : 0x{len(info.trailer):x} bytes")
     print(f"    Trailer SHA-256       : {hashlib.sha256(info.trailer).hexdigest()}")
-    print("    Driver state words    : " + " ".join(f"{word:08x}" for word in trailer.driver_state_words))
+    print(
+        "    Producer extent       : "
+        f"initialized=0x{trailer_summary['producer_initialized_size']:x} "
+        f"exported=0x{trailer_summary['producer_export_size']:x}"
+    )
+    print(
+        "    Producer padding      : "
+        f"0x{trailer_summary['producer_padding_size']:x} bytes, "
+        f"nonzero={trailer_summary['producer_padding_nonzero_bytes']} "
+        "(excluded from GPU-state interpretation)"
+    )
+    print(
+        "    Padding SHA-256       : "
+        f"{trailer_summary['producer_padding_sha256']}"
+    )
+    print("    GPU driver object     :")
+    for item in trailer_summary["driver_state"]:
+        print(
+            f"      +0x{item['source_object_offset']:03x}="
+            f"0x{item['value']:08x}"
+        )
+    print("      Field semantics are not established.")
     print("\nREGISTER_DEFINITION_SOURCES:")
     print("    Built-in SGX543 diagnostic register set")
     for source in database.sources:
@@ -833,11 +1008,39 @@ def _print_gpu_info(info: GpuInfo, database: RegisterDatabase) -> None:
 
 def _print_fault_records(diagnosis: dict) -> None:
     faults = diagnosis["fault_sources"]
+    groups = diagnosis["fault_groups"]
     print(f"\nFAULT_RECORD_COUNT: {len(faults)}")
     if not faults:
         print("\nFAULTING_GPU_ADDRESS: none retained")
         print("    BIF requestor/type latch clear; BIF fault-address registers clear.")
         return
+    print(f"\nFAULT_GROUP_COUNT: {len(groups)}")
+    for group in groups:
+        print(f"\nFAULT_GROUP_{group['index']}:")
+        print(f"    GPU virtual page       : {_hex(group['gpu_virtual_address'])}")
+        print(f"    Observed scopes        : {', '.join(group['scopes'])}")
+        print(f"    Source records         : {', '.join(str(value) for value in group['source_indices'])}")
+        print(
+            "    Requestor              : "
+            + (", ".join(group["requestor_names"]) or "none")
+        )
+        _print_requestor_details(group["requestor_details"])
+        print(f"    MMU context            : {group['context_id']}")
+        print(f"    Page directory         : {_hex(group['page_directory_base'])}")
+        print(
+            "    Sidebands              : "
+            + (", ".join(str(value) for value in group["sidebands"]) or "none")
+        )
+        print(f"    Null GPU page          : {str(group['null_address']).lower()}")
+        if group["multiple_scope_observation"]:
+            print(
+                "    Synthesis              : same page/requestor/context/directory "
+                "fault tuple retained by multiple cores"
+            )
+        elif group["null_address"]:
+            print("    Synthesis              : valid BIF request targets GPU page zero")
+        else:
+            print("    Synthesis              : one retained hardware fault observation")
     for index, fault in enumerate(faults):
         print(f"\nFAULT_RECORD_{index}:")
         print(f"    Scope                  : {fault['scope']}")
@@ -854,6 +1057,7 @@ def _print_fault_records(diagnosis: dict) -> None:
             "    Requestor              : "
             + (", ".join(fault["requestor_names"]) or "none")
         )
+        _print_requestor_details(fault["requestor_details"])
         print(f"    Hardware fault type    : {fault['fault_type']}")
         print(
             "    Fault conditions       : "
@@ -891,9 +1095,10 @@ def _print_fault_records(diagnosis: dict) -> None:
                     values = ",".join(_hex(value) for value in reference["values"])
                 else:
                     values = _hex(reference["value"])
+                fields = ",".join(reference["address_fields"])
                 print(
                     f"      {name} ({location}, offset=0x{reference['offset']:04x}, "
-                    f"value={values})"
+                    f"field={fields}, value={values})"
                 )
         capture = fault["address_capture_evidence"]
         print(f"    Dump address overlap    : {_address_capture_text(capture)}")
@@ -910,6 +1115,20 @@ def _print_fault_records(diagnosis: dict) -> None:
         else:
             meaning = "No captured address register contains the same 4 KiB page."
         print(f"    Interpretation         : {meaning}")
+
+
+def _print_requestor_details(details: list[dict]) -> None:
+    if not details:
+        return
+    resource_classes = list(
+        dict.fromkeys(item["resource_class"] for item in details)
+    )
+    print(f"    Resource class         : {', '.join(resource_classes)}")
+    for item in details:
+        print(
+            f"    Request path           : bit {item['bit']} "
+            f"({item['code']}): {item['interpretation']}"
+        )
 
 
 def _print_bif_register_state(info: GpuInfo) -> None:
@@ -931,11 +1150,21 @@ def _register_field_text(
     database: RegisterDatabase, offset: int, master: bool, value: int
 ) -> str:
     fields = decoded_fields(database.definition(offset, master=master), value)
-    return ", ".join(f"{field['name']}={field['value']:#x}" for field in fields)
+    return ", ".join(_decoded_field_text(field) for field in fields)
+
+
+def _decoded_field_text(field: dict) -> str:
+    # Shifted address bitfields are encoded in alignment units.  Human output
+    # should show the address represented by the register, not that encoded
+    # integer; JSON retains both values.
+    value = field.get("address", field["value"])
+    return f"{field['name']}={value:#x}"
 
 
 def _print_pipeline_register_state(
-    info: GpuInfo, database: RegisterDatabase
+    info: GpuInfo,
+    database: RegisterDatabase,
+    cores: Optional[Sequence[int]] = None,
 ) -> None:
     master_offsets = (0x4118, 0x412C, 0x4348, 0x4400, 0x4758)
     core_offsets = (0x0118, 0x012C, 0x0348, 0x0400, 0x0758)
@@ -957,12 +1186,16 @@ def _print_pipeline_register_state(
         name = definition.display_name if definition else f"REG_{offset:04X}"
         print(f"    {name}:")
         for index, value in enumerate(values):
+            if cores is not None and index not in cores:
+                continue
             fields = _register_field_text(database, offset, False, value)
             suffix = f" [{fields}]" if fields else ""
             print(f"      core{index}={_hex(value)}{suffix}")
 
 
-def _print_firmware_pipeline_diagnostics(diagnosis: dict) -> None:
+def _print_firmware_pipeline_diagnostics(
+    diagnosis: dict, cores: Optional[Sequence[int]] = None
+) -> None:
     pipeline = diagnosis["firmware_pipeline"]
     master = pipeline["master"]
     print("\nFIRMWARE_PIPELINE_DIAGNOSTICS:")
@@ -979,7 +1212,14 @@ def _print_firmware_pipeline_diagnostics(diagnosis: dict) -> None:
         f"partial-render={str(master['partial_render_active']).lower()} "
         f"partial-render-deadlock={str(master['partial_render_deadlock']).lower()}"
     )
+    if cores is not None:
+        print(
+            "    Selected cores        : "
+            + (",".join(str(item) for item in cores) or "none")
+        )
     for core in pipeline["cores"]:
+        if cores is not None and core["core"] not in cores:
+            continue
         phases = ",".join(core["active_phases"]) or "none"
         units = ", ".join(item["name"] for item in core["active_units"]) or "none"
         print(
@@ -1087,6 +1327,83 @@ def _print_firmware_pipeline_diagnostics(diagnosis: dict) -> None:
     print("    MEM_BLK matches are direct address overlaps; they do not prove GPU-MMU ownership.")
 
 
+def _print_firmware_pipeline_summary(
+    diagnosis: dict, cores: Sequence[int]
+) -> None:
+    pipeline = diagnosis["firmware_pipeline"]
+    master = pipeline["master"]
+    print("\nFIRMWARE_PIPELINE:")
+    print(f"    Decoder               : {pipeline['decoder']}")
+    print(
+        "    Master                : "
+        f"transfer={str(master['transfer_active']).lower()} "
+        f"partial-render={str(master['partial_render_active']).lower()} "
+        f"deadlock={str(master['partial_render_deadlock']).lower()}"
+    )
+    for core in pipeline["cores"]:
+        if core["core"] not in cores:
+            continue
+        phases = ",".join(core["active_phases"]) or "none"
+        units = ",".join(item["name"] for item in core["active_units"]) or "none"
+        print(
+            f"    core{core['core']}: phases={phases} units={units} "
+            f"phase-selector={_hex(core['phase_value'])} "
+            f"unit-selector={_hex(core['unit_value'])}"
+        )
+        diverged = [
+            item["name"]
+            for item in core["draw_counter_checks"] + core["tile_checks"]
+            if not item["aligned"]
+        ]
+        progress = core["isp_progress"]
+        bounds = core["render_bounds"]
+        details = []
+        if progress is not None:
+            details.append(
+                f"isp=primitive:{progress['primitive_number']} "
+                f"tile:{progress['tile_x']},{progress['tile_y']} "
+                f"pixel:{progress['pixel_x']},{progress['pixel_y']}"
+            )
+        if bounds is not None:
+            details.append(
+                f"bounds={bounds['width_pixels']}x{bounds['height_pixels']}"
+            )
+        details.append(f"region-headers={_hex(core['region_header_base'])}")
+        details.append(f"diverged={','.join(diverged) or 'none'}")
+        print("        " + "  ".join(details))
+    print("    Use --details for retained counters, tiles, surfaces, and register fields.")
+
+
+def _compact_firmware_pipeline(pipeline: dict, cores: Sequence[int]) -> dict:
+    return {
+        "decoder": pipeline["decoder"],
+        "master": pipeline["master"],
+        "selected_cores": list(cores),
+        "cores": [
+            {
+                key: core[key]
+                for key in (
+                    "core",
+                    "phase_value",
+                    "unit_value",
+                    "active_phases",
+                    "active_units",
+                    "draw_counter_checks",
+                    "tile_checks",
+                    "isp_progress",
+                    "render_bounds",
+                    "region_header_base",
+                    "region_header_base_raw",
+                    "region_header_evidence",
+                    "zls",
+                )
+            }
+            for core in pipeline["cores"]
+            if core["core"] in cores
+        ],
+    }
+
+
 def _print_hardware_signals(diagnosis: dict) -> None:
     signals = diagnosis["event_signals"]
     print("\nHARDWARE_ERROR_SIGNALS:")
@@ -1102,9 +1419,24 @@ def _print_hardware_signals(diagnosis: dict) -> None:
         print(f"            {signal['description']}")
 
 
-def _print_lockup_state(diagnosis: dict) -> None:
+def _gpu_scope_selected(scope: str, cores: Optional[Sequence[int]]) -> bool:
+    if cores is None or not scope.startswith("core"):
+        return True
+    try:
+        return int(scope[4:]) in cores
+    except ValueError:
+        return True
+
+
+def _print_lockup_state(
+    diagnosis: dict, cores: Optional[Sequence[int]] = None
+) -> None:
     print("\nLOCKUP_PHASES:")
-    phases = diagnosis["lockup_phases"]
+    phases = [
+        item
+        for item in diagnosis["lockup_phases"]
+        if _gpu_scope_selected(item["scope"], cores)
+    ]
     if not phases:
         print("    No TA/vertex or 3D/fragment phase latch is retained.")
     for phase in phases:
@@ -1113,7 +1445,11 @@ def _print_lockup_state(diagnosis: dict) -> None:
             f"value={_hex(phase['register_value'])} mask={_hex(phase['mask'])}"
         )
     print("\nPIPELINE_COMPLETION_MARKERS:")
-    markers = diagnosis["pipeline_markers"]
+    markers = [
+        item
+        for item in diagnosis["pipeline_markers"]
+        if _gpu_scope_selected(item["scope"], cores)
+    ]
     if not markers:
         print("    No decoded completion or partial-render marker is set.")
     for marker in markers:
@@ -1213,6 +1549,59 @@ def _print_capture_evidence(
         )
 
 
+def _print_resource_pointers(diagnosis: dict) -> None:
+    evidence = diagnosis["resource_pointers"]
+    print("\nGPU_RETAINED_RESOURCE_POINTERS:")
+    print(f"    Selection             : {evidence['selection']}")
+    print(f"    Pointer groups        : {evidence['pointer_count']}")
+    print(f"    Register observations : {evidence['observation_count']}")
+    print(f"    Allocation matches    : {evidence['allocation_match_count']}")
+    if not evidence["pointers"]:
+        print("    No selected nonzero resource pointer was retained.")
+        return
+    for pointer in evidence["pointers"]:
+        locations = []
+        if pointer["master_observed"]:
+            locations.append("master")
+        if pointer["core_indices"]:
+            locations.append(
+                "cores=" + ",".join(str(index) for index in pointer["core_indices"])
+            )
+        print(
+            f"    [{pointer['index']:02d}] {pointer['name']} ({pointer['stage']}) "
+            f"address={_hex(pointer['address'])} observed={'; '.join(locations)}"
+        )
+        allocation = pointer["allocation"]
+        if allocation is None:
+            print("         Allocation       : no direct MEM_BLK_INFO overlap")
+        else:
+            print(
+                f"         Allocation       : [{allocation['index']}] "
+                f"{allocation['name'] or '<unnamed>'}+0x{allocation['offset']:x} "
+                f"range={allocation['base']:08x}-{allocation['end']:08x}"
+            )
+            print(
+                f"         Captured bytes   : pointer=0x{pointer['captured_bytes_at_address']:x}/0x10 "
+                f"allocation=0x{allocation['captured_bytes']:x}/0x{allocation['size']:x}"
+            )
+        print("         Registers        :")
+        for observation in pointer["observations"]:
+            location = (
+                "master"
+                if observation["scope"] == "master"
+                else f"core{observation['core']}"
+            )
+            print(
+                f"             {location} offset=0x{observation['register_offset']:04x} "
+                f"raw={_hex(observation['raw_value'])} "
+                f"mask={_hex(observation['address_mask'])}"
+            )
+    print(
+        "    Allocation matches are direct numeric overlaps; they do not prove "
+        "GPU-MMU ownership or retain the pointed-to bytes."
+    )
+
+
 def _print_allocation_evidence(diagnosis: dict) -> None:
     evidence = diagnosis["allocation_evidence"]
     print("\nGPU_NAMED_ALLOCATIONS:")
@@ -1241,6 +1630,26 @@ def _print_allocation_evidence(diagnosis: dict) -> None:
     print(
         "    Name selection does not establish GPU-VA ownership or fault-address overlap."
     )
+
+
+def _print_allocation_summary(diagnosis: dict) -> None:
+    evidence = diagnosis["allocation_evidence"]
+    print("\nGPU_NAMED_ALLOCATION_SUMMARY:")
+    print(
+        f"    count={evidence['allocation_count']} "
+        f"virtual=0x{evidence['total_size']:x} "
+        f"committed=0x{evidence['total_committed_size']:x}"
+    )
+    if evidence["category_bytes"]:
+        print(
+            "    categories: "
+            + ", ".join(
+                f"{category}={evidence['category_counts'][category]}/"
+                f"0x{evidence['category_bytes'][category]:x}"
+                for category in sorted(evidence["category_bytes"])
+            )
+        )
+    print("    Use --allocations to list every selected allocation range.")
 
 
 def _print_log_evidence(diagnosis: dict, line_limit: int) -> None:
@@ -1313,9 +1722,11 @@ def _print_failure_identity(diagnosis: dict) -> None:
     process = diagnosis["execution_context"]["process"] or {}
     process_name = process.get("process_name") or "<unavailable>"
     process_id = _hex(process.get("process_id"))
-    scopes = ",".join(fault["scope"] for fault in diagnosis["fault_sources"]) or "none"
+    scopes = ",".join(
+        scope for group in diagnosis["fault_groups"] for scope in group["scopes"]
+    ) or "none"
     addresses = ",".join(
-        _hex(fault["gpu_virtual_address"]) for fault in diagnosis["fault_sources"]
+        _hex(group["gpu_virtual_address"]) for group in diagnosis["fault_groups"]
     ) or "none"
     print(f"\nPROCESS_NAME:  {process_name}")
     print(f"PROCESS_ID:    {process_id}")
@@ -1339,8 +1750,12 @@ def _print_diagnosis(
     print(f"\n{diagnosis['analysis_code']}\n")
     print(diagnosis["headline"] + ".")
     print(diagnosis["explanation"])
-    print(f"\nANALYSIS_CONFIDENCE: {diagnosis['confidence'].upper()}\n")
-    _print_key_values(core, info, diagnosis)
+    print(
+        f"\nCLASSIFICATION_CONFIDENCE: "
+        f"{diagnosis['classification_confidence'].upper()}"
+    )
+    print(f"ROOT_CAUSE_CONFIDENCE: {diagnosis['root_cause_confidence'].upper()}\n")
+    _print_analysis_summary(core, info, diagnosis)
     _print_dump_attributes(core)
     _print_note_coverage(diagnosis)
     _print_supporting_context(diagnosis)
@@ -1355,6 +1770,7 @@ def _print_diagnosis(
     _print_hardware_signals(diagnosis)
     _print_lockup_state(diagnosis)
     _print_context_table(info, diagnosis)
+    _print_resource_pointers(diagnosis)
     _print_allocation_evidence(diagnosis)
     _print_capture_evidence(core, activity, diagnosis)
     if not args.no_log:
@@ -1374,6 +1790,7 @@ def command_analyze(args: argparse.Namespace) -> int:
     database = _database(args)
     info = _gpu_info(core)
     result = core.summary()
+    validation = validate_core(core)
     result["register_definition_sources"] = database.sources
     result["gpu_info"] = info.summary(database) if info else None
     activity = _gpu_activity(core)
@@ -1387,6 +1804,8 @@ def command_analyze(args: argparse.Namespace) -> int:
         else None
     )
     if diagnosis is not None:
+        diagnosis["validation"] = validation
+        diagnosis["wait_graph"] = wait_graph(core, database, diagnosis)
         diagnosis["binary_images"] = (
             enrich_diagnosis_with_elfs(diagnosis, args.images, args.sdk)
             if args.images
@@ -1462,6 +1881,1001 @@ def command_analyze(args: argparse.Namespace) -> int:
     return 0
 
 
+def command_address(args: argparse.Namespace) -> int:
+    core = CoreDump.read(args.dump)
+    database = _database(args)
+    report = address_report(core, database, args.address, args.bytes)
+    if args.images:
+        report["binary_images"] = enrich_address_with_elfs(
+            core, report, args.images, args.sdk
+        )
+    if args.json:
+        json.dump(report, sys.stdout, indent=2, sort_keys=True)
+        print()
+        return 0
+
+    print(f"Address: 0x{report['address']:08x}")
+    print(f"Status : {report['status']}")
+    print(f"Result : {report['conclusion']}")
+    for note in report["value_notes"]:
+        print(f"Note   : {note}")
+    module = report["module"]
+    if module is not None:
+        print(
+            f"Module : {module['notation']} "
+            f"({module['segment_permissions']})"
+        )
+    if report.get("binary_images"):
+        for item in report["binary_images"]["resolutions"]:
+            location = item["location"]
+            symbol = location["symbol"]
+            symbol_text = (
+                f" {symbol['name']}+0x{symbol['offset']:x}" if symbol else ""
+            )
+            print(
+                f"Image  : {location['image_path']} "
+                f"runtime={_hex(report['address'])} "
+                f"ELF={_hex(location['elf_virtual_address'])} "
+                f"segment{location['segment_number']}+0x{location['segment_offset']:x}"
+                f"{symbol_text}"
+            )
+            source = item.get("source")
+            if source is not None:
+                print(f"Source : {source['function']} at {source['file_line']}")
+            if item["disassembly"]:
+                print(
+                    f"Decode : {item['instruction_set']} "
+                    f"({item['instruction_set_basis']}); addresses below are ELF VAs"
+                )
+                for line in item["disassembly"]:
+                    marker = "=>" if line.startswith(
+                        f"{location['elf_virtual_address']:x}:"
+                    ) else "  "
+                    print(f"    {marker} {line}")
+            elif item["disassembly_error"]:
+                print(f"Decode : unavailable ({item['disassembly_error']})")
+        if not report["binary_images"]["resolutions"]:
+            print("Image  : no supplied image resolved this runtime address")
+            for item in report["binary_images"]["images"]:
+                association = item.get("association", {})
+                reasons = association.get("reasons", [])
+                reason = reasons[0] if reasons else item.get(
+                    "error", item.get("address_status", item["status"])
+                )
+                print(f"         {item['path']}: {reason}")
+
+    print("\nCAPTURED_RANGES:")
+    if not report["load_segments"]:
+        print("    none")
+    for segment in report["load_segments"]:
+        state = "bytes captured" if segment["captured_at_address"] else "memory extent only"
+        print(
+            f"    ph{segment['index']}+0x{segment['offset']:x} "
+            f"{segment['virtual_address']:08x}-{segment['memory_end']:08x} ({state})"
+        )
+
+    print("\nMEMORY_BLOCKS:")
+    if not report["memory_blocks"]:
+        print("    none")
+    for block in report["memory_blocks"]:
+        print(
+            f"    [{block['index']}] {block['base']:08x}-{block['end']:08x} "
+            f"+0x{block['offset']:x} captured=0x{block['captured_bytes']:x} "
+            f"{block['name'] or '<unnamed>'}"
+        )
+
+    print("\nTHREAD_REFERENCES:")
+    if not report["threads"]:
+        print("    none")
+    for thread in report["threads"]:
+        details = []
+        if thread["in_stack_range"]:
+            details.append(f"stack+0x{thread['stack_offset']:x}")
+        if thread["registers"]:
+            details.append("registers=" + ",".join(thread["registers"]))
+        print(
+            f"    [{thread['index']}] uid={_hex(thread['uid'])} "
+            f"{thread['name'] or '<unnamed>'}: {'; '.join(details)}; "
+            f"state={thread['status_name']}; "
+            f"context={'saved' if thread['register_context_live'] else 'non-live'}"
+        )
+
+    print("\nGPU_REFERENCES:")
+    if not any(
+        (
+            report["gpu_fault_groups"],
+            report["gpu_resource_pointers"],
+            report["gpu_register_references"],
+        )
+    ):
+        print("    none")
+    for group in report["gpu_fault_groups"]:
+        owner = group["context_attribution"]["owner"]
+        owner_text = (
+            f" owner={owner['process_name'] or '<unnamed>'}"
+            if owner is not None
+            else " owner=<unresolved>"
+        )
+        print(
+            f"    fault group {group['index']}: page={_hex(group['gpu_virtual_address'])} "
+            f"requestor={','.join(group['requestor_names']) or 'none'} "
+            f"context={group['context_id']}{owner_text} scopes={','.join(group['scopes'])}"
+        )
+    for pointer in report["gpu_resource_pointers"]:
+        print(
+            f"    resource {pointer['code']}: {_hex(pointer['address'])} "
+            f"({pointer['relation']})"
+        )
+    for register in report["gpu_register_references"]:
+        location = (
+            "master" if register["scope"] == "master" else f"core{register['core']}"
+        )
+        fields = ", ".join(
+            f"{field['name']}={_hex(field['address'])} ({field['relation']})"
+            for field in register["fields"]
+        )
+        name = register["name"] or f"REG_{register['offset']:04X}"
+        print(
+            f"    {location} {name}: {fields}"
+        )
+
+    preview = report["memory_preview"]
+    print("\nMEMORY_PREVIEW:")
+    if preview["captured_size"]:
+        print(_hexdump(bytes.fromhex(preview["bytes_hex"]), preview["address"]))
+    elif preview["requested_size"] == 0:
+        print("    disabled (--bytes 0)")
+    else:
+        print("    bytes not captured")
+    for limitation in report["limitations"]:
+        print(f"\nLIMITATION: {limitation}")
+    return 0
+
+
+def command_map(args: argparse.Namespace) -> int:
+    core = CoreDump.read(args.dump)
+    report = retained_map(core)
+    if args.captured_only or args.unique:
+        retained_indices = [
+            index
+            for index, item in enumerate(report["entries"])
+            if (not args.captured_only or item["captured_bytes"])
+            and (
+                not args.unique
+                or item["kind"] != "load-segment"
+                or not item["alias_segment_indices"]
+                or item["segment_index"] == min(item["alias_segment_indices"])
+            )
+        ]
+        remap = {old: new for new, old in enumerate(retained_indices)}
+        report["entries"] = [report["entries"][index] for index in retained_indices]
+        report["overlaps"] = [
+            {**item, "left": remap[item["left"]], "right": remap[item["right"]]}
+            for item in report["overlaps"]
+            if item["left"] in remap and item["right"] in remap
+        ]
+        report["entry_count"] = len(report["entries"])
+        report["overlap_count"] = len(report["overlaps"])
+        report["captured_entry_count"] = sum(
+            bool(item["captured_bytes"]) for item in report["entries"]
+        )
+        report["metadata_only_entry_count"] = sum(
+            not item["captured_bytes"] for item in report["entries"]
+        )
+    report["captured_only"] = bool(args.captured_only)
+    report["unique_aliases"] = bool(args.unique)
+    if args.json:
+        json.dump(report, sys.stdout, indent=2, sort_keys=True)
+        print()
+        return 0
+    print(
+        f"Address map: {report['entry_count']} ranges  "
+        f"captured={report['captured_entry_count']} "
+        f"metadata-only={report['metadata_only_entry_count']}"
+    )
+    print("  START     END       SIZE      CAPTURED  PERM KIND            NAME")
+    for item in report["entries"]:
+        permissions = item["permissions"] or "---"
+        print(
+            f"  {item['start']:08x}  {item['end']:08x}  "
+            f"{item['size']:08x}  {item['captured_bytes']:08x}  "
+            f"{permissions:4} {item['kind']:<15} {item['name'] or '<unnamed>'}"
+        )
+    print(
+        f"\nOverlaps: {report['overlap_count']} "
+        "(module, stack, allocation, and PT_LOAD views may describe the same range)"
+    )
+    return 0
+
+
+def command_modules(args: argparse.Namespace) -> int:
+    core = CoreDump.read(args.dump)
+    report = modules_report(core)
+    if args.json:
+        json.dump(report, sys.stdout, indent=2, sort_keys=True)
+        print()
+        return 0
+    print(f"Modules: {report['module_count']}")
+    print("  IDX UID        SIZE      CAPTURED EXEC/PC NAME")
+    for item in report["modules"]:
+        print(
+            f"  {item['index']:3d} {item['uid']:08x} {item['total_size']:08x} "
+            f"{item['captured_bytes']:08x} "
+            f"{len(item['execution_threads']):2d}/"
+            f"{len(item['threads_with_retained_pc']):<2d} "
+            f"{item['name'] or '<unnamed>'}"
+        )
+    print("\nUse 'module DUMP SELECTOR' for segment and execution details.")
+    return 0
+
+
+def command_module(args: argparse.Namespace) -> int:
+    core = CoreDump.read(args.dump)
+    report = module_report(core, args.module)
+    if args.images:
+        _info, diagnosis = load_debug_state(core, _database(args))
+        binary_images = enrich_diagnosis_with_elfs(diagnosis, args.images, args.sdk)
+        module_index = report["module"]["index"]
+        report["binary_images"] = {
+            **{key: value for key, value in binary_images.items() if key != "images"},
+            "images": [
+                image
+                for image in binary_images["images"]
+                if (image.get("association") or {}).get("module_index")
+                in (None, module_index)
+            ],
+        }
+        for image in report["binary_images"]["images"]:
+            imports = image.get("imports")
+            if imports is None:
+                continue
+            image["import_details_included"] = bool(args.imports)
+            if args.imports:
+                continue
+            image["imports"] = [
+                {
+                    **{
+                        key: value
+                        for key, value in library.items()
+                        if key != "functions"
+                    },
+                    "resolved_function_count": sum(
+                        function["name"] is not None
+                        for function in library["functions"]
+                    ),
+                }
+                for library in imports
+            ]
+    if args.json:
+        json.dump(report, sys.stdout, indent=2, sort_keys=True)
+        print()
+        return 0
+    item = report["module"]
+    print(
+        f"Module [{item['index']}] {item['name'] or '<unnamed>'} "
+        f"uid={_hex(item['uid'])}"
+    )
+    print(
+        f"Extent: 0x{item['total_size']:x}  captured=0x{item['captured_bytes']:x} "
+        f"execution-contexts={len(item['execution_threads'])} "
+        f"retained-pcs={len(item['threads_with_retained_pc'])}"
+    )
+    print("\nSEGMENTS:")
+    for segment in item["segments"]:
+        print(
+            f"    {segment['number']}: {segment['start']:08x}-{segment['end']:08x} "
+            f"{segment['permissions']} size=0x{segment['size']:x} "
+            f"captured=0x{segment['captured_bytes']:x}"
+        )
+    print("\nEXECUTION:")
+    if not item["threads_with_retained_pc"]:
+        print("    no retained thread PC is in this module")
+    for thread in item["threads_with_retained_pc"]:
+        qualification = "saved" if thread["register_context_live"] else "non-live"
+        print(
+            f"    [{thread['index']}] {_hex(thread['uid'])} "
+            f"{thread['location']['notation']} {thread['status_name']} {qualification} "
+            f"{thread['name'] or '<unnamed>'}"
+        )
+    images = (report.get("binary_images") or {}).get("images", [])
+    if args.images:
+        print("\nIMAGES:")
+        if not images:
+            print("    no supplied image matched this captured module")
+        for image in images:
+            association = image.get("association")
+            if association is None:
+                print(f"    {image['path']} (invalid: {image['error']})")
+                continue
+            print(
+                f"    {image['path']} ({image['source_format']}, "
+                f"{association.get('match_quality') or association['status']})"
+            )
+            if association["module_index"] == item["index"]:
+                print(
+                    f"      symbols={image['symbol_count']} "
+                    f"imports={image['import_function_count']} "
+                    f"resolved-imports={image['resolved_import_function_count']}"
+                )
+            for reason in association["reasons"]:
+                print(f"      rejected: {reason}")
+            for warning in association.get("warnings", []):
+                print(f"      warning: {warning}")
+    return 0
+
+
+def command_xref(args: argparse.Namespace) -> int:
+    core = CoreDump.read(args.dump)
+    report = xref_report(core, _database(args), args.address, args.max_results)
+    if args.json:
+        json.dump(report, sys.stdout, indent=2, sort_keys=True)
+        print()
+        return 0
+    print(
+        f"Cross-references to {_hex(report['address'])}: "
+        f"direct={report['direct_reference_count']} "
+        f"memory={report['memory_reference_count']}"
+    )
+    target = report["target"]
+    print(f"\nTARGET: {target['status']}")
+    print(f"    {target['conclusion']}")
+    for note in target["value_notes"]:
+        print(f"    note: {note}")
+    if target["module"] is not None:
+        print(f"    module: {target['module']['notation']}")
+    for block in target["memory_blocks"]:
+        print(
+            f"    allocation: [{block['index']}] {block['name'] or '<unnamed>'}"
+            f"+0x{block['offset']:x}"
+        )
+    for thread in target["threads"]:
+        relations = []
+        if thread["in_stack_range"]:
+            relations.append(f"stack+0x{thread['stack_offset']:x}")
+        relations.extend(thread["registers"])
+        context = "saved" if thread["register_context_live"] else "non-live"
+        print(
+            f"    thread: [{thread['index']}] {thread['name'] or '<unnamed>'} "
+            f"({','.join(relations)}; {thread['status_name']}; {context})"
+        )
+    if target["load_segments"]:
+        captured = sum(
+            item["captured_at_address"] for item in target["load_segments"]
+        )
+        print(
+            f"    PT_LOAD views: {len(target['load_segments'])} "
+            f"({captured} contain captured bytes at the target)"
+        )
+    for group in target["gpu_fault_groups"]:
+        print(
+            f"    GPU fault page: group {group['index']} "
+            f"requestor={','.join(group['requestor_names']) or 'none'}"
+        )
+    for pointer in target["gpu_resource_pointers"]:
+        print(
+            f"    GPU resource: {pointer['name']} ({pointer['stage']}; "
+            f"{pointer['relation']})"
+        )
+
+    print("\nREFERENCES:")
+    if not report["direct_references"] and not report["memory_references"]:
+        print("    none retained")
+    for item in report["direct_references"]:
+        kind = item["kind"]
+        if kind == "cpu-register":
+            context = "saved" if item["register_context_live"] else "non-live"
+            poison = "; poison-sentinel" if item["register_value_poison"] else ""
+            print(
+                f"    cpu [{item['thread_index']}] {_hex(item['thread_uid'])} "
+                f"{item['register']} {item['thread_name'] or '<unnamed>'} "
+                f"({item['status_name']}; {context}{poison})"
+            )
+        elif kind == "gpu-fault":
+            group = item["fault_group"]
+            print(
+                f"    gpu fault group {group['index']} "
+                f"requestor={','.join(group['requestor_names']) or 'none'}"
+            )
+        elif kind == "gpu-resource":
+            pointer = item["resource"]
+            print(f"    gpu resource {pointer['name']} ({pointer['stage']})")
+        else:
+            register = item["register"]
+            print(
+                f"    gpu register {register.get('name') or 'unnamed'} "
+                f"offset={_hex(register.get('offset'), 4)}"
+            )
+    for item in report["memory_references"]:
+        context = []
+        if item["stack_owners"]:
+            owner = item["stack_owners"][0]
+            owner_context = "saved" if owner["register_context_live"] else "non-live"
+            context.append(
+                f"thread[{owner['index']}]+sp{owner['sp_offset']:+#x} "
+                f"({owner['status_name']}; {owner_context})"
+                if owner["sp_offset"] is not None
+                else f"thread[{owner['index']}] stack "
+                f"({owner['status_name']}; {owner_context})"
+            )
+        if item["module"] is not None:
+            context.append(item["module"]["notation"])
+        if item["memory_block"] is not None:
+            block = item["memory_block"]
+            context.append(f"{block['name'] or '<unnamed>'}+0x{block['offset']:x}")
+        print(
+            f"    memory {item['address']:08x} ({item['source_classification']})"
+            + (f"  {'; '.join(context)}" if context else "")
+        )
+    if report["truncated"]:
+        print("    result display truncated; increase --max-results")
+    return 0
+
+
+def command_waits(args: argparse.Namespace) -> int:
+    core = CoreDump.read(args.dump)
+    report = wait_graph(core, _database(args))
+    if args.json:
+        json.dump(report, sys.stdout, indent=2, sort_keys=True)
+        print()
+        return 0
+    print(
+        f"Wait graph: threads={report['thread_count']} "
+        f"objects={report['object_count']} edges={report['edge_count']} "
+        f"cycles={report['cycle_count']}"
+    )
+    nodes = {item["id"]: item for item in report["nodes"]}
+    for edge in report["edges"]:
+        source = nodes.get(edge["source"], {"id": edge["source"]})
+        target = nodes.get(edge["target"], {"id": edge["target"]})
+        source_name = source.get("name") or source["id"]
+        target_name = target.get("name") or target["id"]
+        print(
+            f"    {source_name} --{edge['relation']}--> {target_name} "
+            f"[{'; '.join(edge['evidence'])}]"
+        )
+    if report["unresolved_waits"]:
+        print("\nUNRESOLVED WAIT IDS:")
+        for wait in report["unresolved_waits"]:
+            print(
+                f"    thread[{wait['thread_index']}] {wait['thread_name']} "
+                f"type={_hex(wait['wait_type'])} id={_hex(wait['wait_id'])}"
+            )
+    if report["cycles"]:
+        print("\nCAPTURED DEPENDENCY CYCLES:")
+        for cycle in report["cycles"]:
+            print("    " + " -> ".join(cycle["nodes"]))
+    else:
+        print("\nNo dependency cycle is present in the retained wait/owner fields.")
+    print(f"\nQualification: {report['qualification']}")
+    return 0
+
+
+def command_object(args: argparse.Namespace) -> int:
+    core = CoreDump.read(args.dump)
+    report = object_report(core, _database(args), args.uid)
+    if args.json:
+        json.dump(report, sys.stdout, indent=2, sort_keys=True)
+        print()
+        return 0
+    item = report["object"]
+    print(
+        f"Object {item['kind']} {_hex(item['uid'])} "
+        f"{item['name'] or '<unnamed>'}"
+    )
+    print(
+        f"Waiters: {item['waiting_thread_count']}  "
+        f"owner={_hex(item.get('owner_thread_uid'))}  note={item['note_name']}"
+    )
+    print("State:")
+    for key, value in sorted(item["state"].items()):
+        display = _hex(value) if isinstance(value, int) else value
+        print(f"    {key}: {display}")
+    print("Relationships:")
+    if not report["edges"] and not report["relationships"]:
+        print("    none retained")
+    for edge in report["edges"]:
+        print(
+            f"    {edge['source']} --{edge['relation']}--> {edge['target']} "
+            f"[{'; '.join(edge['evidence'])}]"
+        )
+    for relation in report["relationships"]:
+        print(
+            f"    {relation['source']} --{relation['relation']}--> "
+            f"{relation['target']}"
+        )
+    return 0
+
+
+def command_validate(args: argparse.Namespace) -> int:
+    core = CoreDump.read(args.dump)
+    report = validate_core(core)
+    if args.json:
+        json.dump(report, sys.stdout, indent=2, sort_keys=True)
+        print()
+    else:
+        print(
+            f"Validation: {report['status']}  "
+            f"checks={report['check_count']} passed={report['passed_count']} "
+            f"errors={report['failed_error_count']} "
+            f"warnings={report['failed_warning_count']}"
+        )
+        for item in report["checks"]:
+            mark = "ok" if item["passed"] else item["severity"]
+            print(f"    {mark:<7} {item['code']}: {item['description']}")
+            if not item["passed"] and item["evidence"]:
+                print(f"            {json.dumps(item['evidence'], sort_keys=True)}")
+        print(f"\nScope: {report['scope']}")
+    return 0 if report["valid"] else 1
+
+
+def _triage_group_synopsis(entry: dict, group_kind: str) -> str:
+    if group_kind in ("failure", "failure_pattern"):
+        fault_parts = []
+        for fault in entry["faults"]:
+            prefix = (
+                f"{_hex(fault['page'])}:"
+                if group_kind == "failure"
+                else ""
+            )
+            fault_parts.append(
+                f"{prefix}{'/'.join(fault['requestors']) or 'no-requestor'}"
+                f"[{','.join(fault['conditions']) or 'no-condition'}]"
+                f"/cid={fault['context_id'] if fault['context_id'] is not None else 'unknown'}"
+                f"/scope={','.join(fault['scopes']) or 'none'}"
+            )
+        events = entry["signature_components"]["event_codes"]
+        return (
+            f"classification={entry['classification']} "
+            f"faults={'; '.join(fault_parts) or 'none'} "
+            f"phases={','.join(entry['lockup_phases']) or 'none'} "
+            f"events={','.join(events) or 'none'}"
+        )
+    if group_kind == "pipeline":
+        return (
+            f"phases={','.join(entry['lockup_phases']) or 'none'} "
+            f"active-units={','.join(entry['active_units']) or 'none'}"
+        )
+    return "complete retained GPU register/indexed snapshot; volatile capture metadata excluded"
+
+
+def command_triage(args: argparse.Namespace) -> int:
+    report = triage_dumps(args.dumps, _database(args))
+    if args.json:
+        json.dump(report, sys.stdout, indent=2, sort_keys=True)
+        print()
+        return 0
+    print(
+        f"GPUCRASH triage: dumps={report['dump_count']} "
+        f"errors={report['error_count']} "
+        f"exact-groups={len(report['groups']['failure'])} "
+        f"pattern-groups={len(report['groups']['failure_pattern'])}"
+    )
+    print("\nDUMPS:")
+    for index, item in enumerate(report["entries"]):
+        application = item["application"].get("title_id") or "<unknown-title>"
+        pages = ",".join(_hex(value) for value in item["fault_pages"]) or "none"
+        print(
+            f"    [{index}] {item['classification']} app={application} "
+            f"faults={pages} sig={item['failure_signature'][:12]}"
+        )
+        print(f"        {item['path']}")
+    for name, title in (
+        ("failure", "EXACT FAILURE GROUPS"),
+        ("failure_pattern", "ADDRESS-INDEPENDENT FAILURE GROUPS"),
+        ("pipeline", "PIPELINE GROUPS"),
+        ("register", "REGISTER-STATE GROUPS"),
+    ):
+        print(f"\n{title}:")
+        print(f"    Basis: {report['signature_notes'][name]}")
+        for group in report["groups"][name]:
+            indices = ",".join(str(value) for value in group["entry_indices"])
+            print(
+                f"    {group['signature'][:16]} count={group['count']} "
+                f"dumps=[{indices}]"
+            )
+            representative = report["entries"][group["entry_indices"][0]]
+            print(f"        {_triage_group_synopsis(representative, name)}")
+    print("\nFACETS:")
+    for name, values in report["facets"].items():
+        if values:
+            text = ", ".join(
+                f"{_hex(int(item['value'])) if name == 'fault_page' else item['value']} "
+                f"({item['count']})"
+                for item in values[:8]
+            )
+            print(f"    {name}: {text}")
+    if report["errors"]:
+        print("\nERRORS:")
+        for error in report["errors"]:
+            print(f"    {error['path']}: {error['error']}")
+    return 0
+
+
+def command_threads(args: argparse.Namespace) -> int:
+    core = CoreDump.read(args.dump)
+    report = thread_list_report(core, _database(args))
+    if args.json:
+        json.dump(report, sys.stdout, indent=2, sort_keys=True)
+        print()
+        return 0
+    process = report["process"] or {}
+    print(
+        f"Threads: {report['thread_count']}  process="
+        f"{process.get('process_name') or '<unavailable>'} "
+        f"pid={_hex(process.get('process_id'))}"
+    )
+    print("  IDX UID        STATE      CONTEXT  CPU PRI PC         LOCATION                 NAME")
+    for thread in report["threads"]:
+        location = thread["pc_location"]
+        location_text = location["notation"] if location is not None else "<unresolved>"
+        pc_text = _hex(thread["pc"])[2:] if thread["pc"] is not None else "missing"
+        context = "saved" if thread["register_context_live"] else "non-live"
+        print(
+            f"  {thread['index']:3d} {thread['uid']:08x} "
+            f"{thread['status_name'][:10]:<10} {context:<8} "
+            f"{thread['current_cpu_id']:3d} "
+            f"{thread['current_priority']:3d} {pc_text:8} "
+            f"{location_text[:24]:<24} {thread['name']}"
+        )
+    print("\nUse 'thread DUMP UID' for registers, stack state, and return candidates.")
+    return 0
+
+
+def _thread_image_record(report: dict, runtime_address: int) -> Optional[dict]:
+    images = report.get("binary_images")
+    if images is None:
+        return None
+    for image in images["images"]:
+        for record in image.get("address_records", []):
+            if record["runtime_address"] == runtime_address:
+                return record
+    return None
+
+
+def command_thread(args: argparse.Namespace) -> int:
+    core = CoreDump.read(args.dump)
+    database = _database(args)
+    report, diagnosis = thread_detail_report(
+        core, database, args.thread, args.stack_bytes
+    )
+    report["thread"]["annotated_stack"] = annotated_stack(
+        core, diagnosis, report["thread"], args.stack_bytes
+    )
+    if args.images:
+        diagnosis["binary_images"] = enrich_diagnosis_with_elfs(
+            diagnosis, args.images, args.sdk
+        )
+        selected = next(
+            item
+            for item in diagnosis["execution_context"]["threads"]
+            if item["uid"] == report["thread"]["uid"]
+        )
+        for key in ("pc_image", "lr_image"):
+            if key in selected:
+                report["thread"][key] = selected[key]
+        report["binary_images"] = diagnosis["binary_images"]
+        report["thread"]["unwind"] = unwind_thread(
+            core,
+            diagnosis,
+            report["thread"],
+            args.images,
+            args.max_frames,
+        )
+    if args.json:
+        json.dump(report, sys.stdout, indent=2, sort_keys=True)
+        print()
+        return 0
+
+    thread = report["thread"]
+    print(
+        f"Thread [{thread['index']}] {thread['name'] or '<unnamed>'} "
+        f"uid={_hex(thread['uid'])}"
+    )
+    print(
+        f"State   : {thread['status_name']} status={_hex(thread['status'])} "
+        f"stop={_hex(thread['stop_reason'])}"
+    )
+    print(
+        f"Context : {thread['register_context_qualification']} "
+        f"(poison-registers={thread['poison_register_count']}/16)"
+    )
+    print(
+        f"Schedule: cpu={thread['current_cpu_id']} priority={thread['current_priority']} "
+        f"affinity={_hex(thread['current_cpu_affinity'])} clocks={thread['run_clocks']}"
+    )
+    print(f"Wait    : type={_hex(thread['wait_type'])} id={_hex(thread['wait_id'])}")
+    wait = thread.get("wait_object")
+    if wait is not None:
+        print(
+            f"Object  : {wait['kind']} {_hex(wait['uid'])} "
+            f"{wait['name'] or '<unnamed>'}"
+        )
+    registers = thread["registers"]
+    print("\nREGISTERS:")
+    if registers is None:
+        print("    not retained")
+    else:
+        for row in range(0, 16, 4):
+            print(
+                "    "
+                + "  ".join(
+                    f"r{index:<2}={registers['gpr'][index]:08x}"
+                    for index in range(row, row + 4)
+                )
+            )
+        print(f"    cpsr={registers['cpsr']:08x}")
+        for role in ("pc", "lr"):
+            location = thread[f"{role}_location"]
+            text = location["notation"] if location is not None else "<unresolved>"
+            print(f"    {role.upper():2} -> {text}")
+            image_record = _thread_image_record(report, registers[role])
+            if image_record is not None:
+                symbol = image_record["location"]["symbol"]
+                if symbol is not None:
+                    print(
+                        f"         {symbol['name']}+0x{symbol['offset']:x}"
+                    )
+                source = image_record["source"]
+                if source is not None:
+                    print(f"         {source['function']} at {source['file_line']}")
+                if image_record["disassembly"]:
+                    print(
+                        f"         ELF VA={_hex(image_record['location']['elf_virtual_address'])} "
+                        f"{image_record['instruction_set']} "
+                        f"({image_record['instruction_set_basis']})"
+                    )
+                for line in image_record["disassembly"]:
+                    print(f"         {line}")
+
+    usage = thread["stack_usage"]
+    print("\nSTACK:")
+    print(
+        f"    range={thread['stack_base']:08x}-{thread['stack_end']:08x} "
+        f"size=0x{thread['stack_size']:x} captured-at-sp="
+        f"{str(thread['stack_captured_at_sp']).lower()}"
+    )
+    if usage is not None:
+        print(
+            f"    current=0x{usage['current_bytes']:x} peak=0x{usage['peak_bytes']:x}"
+        )
+    candidates = thread["stack_return_candidates"]
+    print(f"    executable-address candidates={len(candidates)}")
+    for candidate in candidates:
+        image_location = candidate.get("image")
+        symbol = image_location.get("symbol") if image_location is not None else None
+        symbol_text = (
+            f" ({symbol['name']}+0x{symbol['offset']:x})" if symbol else ""
+        )
+        print(
+            f"      {candidate['stack_address']:08x}: {candidate['value']:08x} "
+            f"{candidate['location']['notation']}{symbol_text}"
+        )
+    annotations = thread["annotated_stack"]
+    if annotations["status"] == "non-live-thread-context":
+        print("    annotation skipped: non-live thread context")
+    else:
+        print(
+            f"    classified words={annotations['classified_word_count']}/"
+            f"{annotations['word_count']}"
+        )
+    for word in annotations["words"]:
+        if word["classifications"]:
+            print(
+                f"      sp+0x{word['sp_offset']:04x} {word['stack_address']:08x}: "
+                f"{word['value']:08x}  "
+                f"{_classification_text(word['classifications'])}"
+            )
+    preview = thread["stack_preview"]
+    if preview["captured_size"]:
+        print()
+        print(_hexdump(bytes.fromhex(preview["bytes_hex"]), preview["address"]))
+    elif args.stack_bytes == 0:
+        print("    stack preview disabled")
+    elif preview["requested_size"] == 0:
+        print("    SP has no bytes inside the retained stack range")
+    else:
+        print("    bytes at SP are not captured")
+    unwind = thread.get("unwind")
+    if unwind is not None:
+        print("\nARM EHABI BACKTRACE:")
+        for frame in unwind["frames"]:
+            location = frame["runtime_location"]
+            where = location["notation"] if location is not None else "<unmapped>"
+            symbol = frame["symbol"]
+            if symbol is not None:
+                where += f" ({symbol['name']}+0x{symbol['offset']:x})"
+            print(
+                f"    #{frame['index']:<2} pc={frame['pc']:08x} "
+                f"sp={frame['sp']:08x} {where} [{frame['source']}]"
+            )
+        stop = unwind.get("stop") or {}
+        print(
+            f"    stopped: {stop.get('code', unwind['status'])}"
+            + (f" ({stop['detail']})" if stop.get("detail") else "")
+        )
+        print(f"    {unwind['qualification']}")
+    return 0
+
+
+def command_search(args: argparse.Namespace) -> int:
+    core = CoreDump.read(args.dump)
+    if args.u8 is not None:
+        if not 0 <= args.u8 <= 0xFF:
+            raise ParseError("--u8 value is outside 0..0xff")
+        pattern, description, default_alignment = bytes((args.u8,)), f"u8 {args.u8:#x}", 1
+    elif args.u16 is not None:
+        if not 0 <= args.u16 <= 0xFFFF:
+            raise ParseError("--u16 value is outside 0..0xffff")
+        pattern, description, default_alignment = struct.pack("<H", args.u16), f"u16 {args.u16:#x}", 2
+    elif args.u32 is not None:
+        if not 0 <= args.u32 <= 0xFFFFFFFF:
+            raise ParseError("--u32 value is outside 0..0xffffffff")
+        pattern, description, default_alignment = struct.pack("<I", args.u32), f"u32 {args.u32:#x}", 4
+    elif args.pointers_to is not None:
+        if not 0 <= args.pointers_to <= 0xFFFFFFFF:
+            raise ParseError("--pointers-to address is outside the Vita address space")
+        pattern = struct.pack("<I", args.pointers_to)
+        description = f"little-endian pointer to {args.pointers_to:#x}"
+        default_alignment = 4
+    elif args.bytes_pattern is not None:
+        compact = re.sub(r"[\s:_-]", "", args.bytes_pattern)
+        try:
+            pattern = bytes.fromhex(compact)
+        except ValueError as exc:
+            raise ParseError(f"invalid hexadecimal byte pattern: {exc}") from exc
+        description, default_alignment = f"bytes {pattern.hex()}", 1
+    else:
+        try:
+            pattern = args.string.encode(args.encoding)
+        except (LookupError, UnicodeEncodeError) as exc:
+            raise ParseError(f"cannot encode --string with {args.encoding}: {exc}") from exc
+        description, default_alignment = f"{args.encoding} string {args.string!r}", 1
+    alignment = args.alignment if args.alignment is not None else default_alignment
+    report = search_memory(
+        core,
+        pattern,
+        description,
+        alignment=alignment,
+        max_results=args.max_results,
+        include_aliases=args.include_aliases,
+    )
+    if args.json:
+        json.dump(report, sys.stdout, indent=2, sort_keys=True)
+        print()
+        return 0
+    print(
+        f"Search: {report['pattern']}  alignment={report['alignment']} "
+        f"segments={report['searched_segment_count']} bytes=0x{report['searched_bytes']:x}"
+    )
+    print(
+        f"Matches: {report['match_count']} "
+        f"(showing {report['returned_count']})"
+    )
+    for item in report["results"]:
+        labels = []
+        if item["module"] is not None:
+            labels.append(item["module"]["notation"])
+        if item["memory_block"] is not None:
+            block = item["memory_block"]
+            labels.append(f"{block['name'] or '<unnamed>'}+0x{block['offset']:x}")
+        alias = (
+            " aliases=" + ",".join(str(value) for value in item["alias_segment_indices"])
+            if item["alias_segment_indices"]
+            else ""
+        )
+        print(
+            f"    {item['address']:08x} ph{item['segment_index']}+"
+            f"0x{item['segment_offset']:x}{alias}"
+            + (f"  {'; '.join(labels)}" if labels else "")
+        )
+    if report["truncated"]:
+        print("    result display truncated; increase --max-results for additional matches")
+    return 0
+
+
+def command_gpu(args: argparse.Namespace) -> int:
+    core = CoreDump.read(args.dump)
+    database = _database(args)
+    info, diagnosis = load_debug_state(core, database)
+    if args.view == "faults":
+        result = {
+            "path": str(core.path),
+            "classification": diagnosis["classification"],
+            "fault_sources": diagnosis["fault_sources"],
+            "fault_groups": diagnosis["fault_groups"],
+            "bif": info.bif_diagnosis(),
+        }
+    elif args.view == "contexts":
+        result = {
+            "path": str(core.path),
+            "context_owners": diagnosis["context_owners"],
+            "context_assignments": diagnosis["context_assignments"],
+            "context_slot_map": [
+                list(row) for row in info.decoded_trailer().context_slot_map
+            ],
+        }
+    elif args.view == "pipeline":
+        selected_cores = list(dict.fromkeys(args.cores or range(info.core_count)))
+        invalid_cores = [
+            core for core in selected_cores if not 0 <= core < info.core_count
+        ]
+        if invalid_cores:
+            raise ParseError(
+                "GPU core index out of range: "
+                + ", ".join(str(core) for core in invalid_cores)
+                + f" (available: 0-{info.core_count - 1})"
+            )
+        pipeline = diagnosis["firmware_pipeline"]
+        firmware_pipeline = (
+            {
+                **pipeline,
+                "selected_cores": selected_cores,
+                "cores": [
+                    core for core in pipeline["cores"] if core["core"] in selected_cores
+                ],
+            }
+            if args.details
+            else _compact_firmware_pipeline(pipeline, selected_cores)
+        )
+        result = {
+            "path": str(core.path),
+            "lockup_phases": [
+                item
+                for item in diagnosis["lockup_phases"]
+                if _gpu_scope_selected(item["scope"], selected_cores)
+            ],
+            "pipeline_markers": [
+                item
+                for item in diagnosis["pipeline_markers"]
+                if _gpu_scope_selected(item["scope"], selected_cores)
+            ],
+            "details_included": bool(args.details),
+            "firmware_pipeline": firmware_pipeline,
+        }
+    else:
+        allocation_evidence = diagnosis["allocation_evidence"]
+        result = {
+            "path": str(core.path),
+            "resource_pointers": diagnosis["resource_pointers"],
+            "allocation_details_included": bool(args.allocations),
+            "gpu_named_allocations": (
+                allocation_evidence
+                if args.allocations
+                else {
+                    key: value
+                    for key, value in allocation_evidence.items()
+                    if key != "allocations"
+                }
+            ),
+        }
+    result["schema_version"] = 1
+    result["command"] = f"gpu {args.view}"
+    if args.json:
+        json.dump(result, sys.stdout, indent=2, sort_keys=True)
+        print()
+        return 0
+    if args.view == "faults":
+        print(f"GPU fault state: {diagnosis['classification']}")
+        _print_fault_records(diagnosis)
+        _print_bif_register_state(info)
+    elif args.view == "contexts":
+        _print_context_table(info, diagnosis)
+    elif args.view == "pipeline":
+        if args.details:
+            _print_firmware_pipeline_diagnostics(diagnosis, selected_cores)
+            _print_pipeline_register_state(info, database, selected_cores)
+        else:
+            _print_firmware_pipeline_summary(diagnosis, selected_cores)
+        _print_lockup_state(diagnosis, selected_cores)
+    else:
+        _print_resource_pointers(diagnosis)
+        if args.allocations:
+            _print_allocation_evidence(diagnosis)
+        else:
+            _print_allocation_summary(diagnosis)
+    return 0
+
+
 def _register_matches(name: str, offset: int, matcher: Optional[re.Pattern]) -> bool:
     return matcher is None or matcher.search(name) is not None or matcher.search(f"0x{offset:04x}") is not None
 
@@ -1473,6 +2887,51 @@ def command_registers(args: argparse.Namespace) -> int:
     if info is None:
         raise ParseError("GPU_INFO note is unavailable")
     matcher = re.compile(args.matching, re.IGNORECASE) if args.matching else None
+    if args.json:
+        summary = info.summary(database)
+        master = [
+            item
+            for item in summary["master_registers"]
+            if (args.show_zero or item["value"] != 0)
+            and _register_matches(
+                item["name"] or f"REG_{item['offset']:04X}", item["offset"], matcher
+            )
+        ]
+        per_core = [
+            item
+            for item in summary["per_core_registers"]
+            if (args.show_zero or any(item["values"]))
+            and _register_matches(
+                item["name"] or f"REG_{item['offset']:04X}", item["offset"], matcher
+            )
+        ]
+        indexed = [
+            item
+            for item in summary["indexed_state"]
+            if args.indexed
+            and (args.show_zero or any(item["values"]))
+            and _register_matches(
+                item["name"] or f"SELECTOR_{item['index']:02X}",
+                item["index"],
+                matcher,
+            )
+        ]
+        json.dump(
+            {
+                "schema_version": 1,
+                "command": "registers",
+                "path": str(core.path),
+                "core_count": info.core_count,
+                "master_registers": master,
+                "per_core_registers": per_core,
+                "indexed_state": indexed,
+            },
+            sys.stdout,
+            indent=2,
+            sort_keys=True,
+        )
+        print()
+        return 0
     print("Master registers:")
     for register in info.master_registers:
         definition = database.definition(register.offset, master=True)
@@ -1482,7 +2941,7 @@ def command_registers(args: argparse.Namespace) -> int:
         if not _register_matches(name, register.offset, matcher):
             continue
         fields = decoded_fields(definition, register.value)
-        suffix = " " + ", ".join(f"{item['name']}={item['value']:#x}" for item in fields) if fields else ""
+        suffix = " " + ", ".join(_decoded_field_text(item) for item in fields) if fields else ""
         print(f"  {register.offset:04x} {register.value:08x} {name}{suffix}")
     print("Per-core registers:")
     for register in info.per_core_registers:
@@ -1493,14 +2952,31 @@ def command_registers(args: argparse.Namespace) -> int:
         if not _register_matches(name, register.offset, matcher):
             continue
         values = " ".join(f"c{index}={value:08x}" for index, value in enumerate(register.values))
-        print(f"  {register.offset:04x} {values} {name}")
+        field_text = [
+            _register_field_text(database, register.offset, False, value)
+            for value in register.values
+        ]
+        if field_text and len(set(field_text)) == 1 and field_text[0]:
+            suffix = f" {field_text[0]}"
+        else:
+            decoded = " ".join(
+                f"c{index}[{text}]"
+                for index, text in enumerate(field_text)
+                if text
+            )
+            suffix = f" {decoded}" if decoded else ""
+        print(f"  {register.offset:04x} {values} {name}{suffix}")
     if args.indexed:
         print("Indexed per-core state:")
         for item in info.indexed_state:
+            metadata = indexed_selector_metadata(item.offset)
+            name = metadata["name"] if metadata is not None else f"SELECTOR_{item.offset:02X}"
             if not args.show_zero and not any(item.values):
                 continue
+            if not _register_matches(name, item.offset, matcher):
+                continue
             values = " ".join(f"c{index}={value:08x}" for index, value in enumerate(item.values))
-            print(f"  {item.offset:04x} {values}")
+            print(f"  {item.offset:04x} {values} {name}")
     return 0
 
 
@@ -1513,10 +2989,154 @@ def command_compare(args: argparse.Namespace) -> int:
     if left is None or right is None:
         raise ParseError("both dumps must contain GPU_INFO")
     comparison = compare_gpu_info(left, right, database)
+    unfiltered_change_counts = {
+        "header": len(comparison["header_changes"]),
+        "master_register": len(comparison["master_changes"]),
+        "per_core_register": len(comparison["per_core_changes"]),
+        "indexed_state": len(comparison["indexed_state_changes"]),
+        "context_owner": len(comparison["context_owner_changes"]),
+        "driver_state": len(comparison["driver_state_changes"]),
+    }
+    _left_info, left_diagnosis = load_debug_state(left_core, database)
+    _right_info, right_diagnosis = load_debug_state(right_core, database)
+    debug_comparison = compare_debug_state(left_diagnosis, right_diagnosis)
+    allowed_sections = {
+        "verdict",
+        "faults",
+        "contexts",
+        "pipeline",
+        "resources",
+        "threads",
+        "allocations",
+    }
+    requested_sections = []
+    for value in args.sections:
+        requested_sections.extend(
+            item.strip().casefold() for item in value.split(",") if item.strip()
+        )
+    unknown_sections = sorted(set(requested_sections) - allowed_sections)
+    if unknown_sections:
+        raise ParseError(
+            "unknown compare section(s): " + ", ".join(unknown_sections)
+        )
+    selected_sections = set(requested_sections) or allowed_sections
+    matcher = None
+    if args.matching:
+        try:
+            matcher = re.compile(args.matching, re.IGNORECASE)
+        except re.error as exc:
+            raise ParseError(f"invalid --matching regular expression: {exc}") from exc
+    raw_registers = args.registers or args.show_indexed or matcher is not None
+    if matcher is not None:
+        comparison["master_changes"] = [
+            item
+            for item in comparison["master_changes"]
+            if _register_matches(
+                item["name"] or f"REG_{item['offset']:04X}",
+                item["offset"],
+                matcher,
+            )
+        ]
+        comparison["per_core_changes"] = [
+            item
+            for item in comparison["per_core_changes"]
+            if _register_matches(
+                item["name"] or f"REG_{item['offset']:04X}",
+                item["offset"],
+                matcher,
+            )
+        ]
+        comparison["indexed_state_changes"] = [
+            item
+            for item in comparison["indexed_state_changes"]
+            if _register_matches(
+                item["name"] or f"SELECTOR_{item['index']:02X}",
+                item["index"],
+                matcher,
+            )
+        ]
+    postmortem_keys = {
+        "verdict": "verdict",
+        "faults": "fault_groups",
+        "contexts": "context_assignment_changes",
+        "pipeline": "pipeline",
+        "resources": "resource_pointers",
+        "threads": "thread_changes",
+        "allocations": "allocations",
+    }
+    postmortem_view = {
+        output_key: debug_comparison[output_key]
+        for section, output_key in postmortem_keys.items()
+        if section in selected_sections
+    }
+    if args.summary_only:
+        summarized = {}
+        if "verdict" in selected_sections:
+            summarized["verdict"] = debug_comparison["verdict"]
+        if "faults" in selected_sections:
+            value = debug_comparison["fault_groups"]
+            summarized["fault_groups"] = {
+                "added_count": len(value["added"]),
+                "removed_count": len(value["removed"]),
+                "changed_count": len(value["changed"]),
+            }
+        if "contexts" in selected_sections:
+            summarized["context_assignment_change_count"] = len(
+                debug_comparison["context_assignment_changes"]
+            )
+        if "pipeline" in selected_sections:
+            value = debug_comparison["pipeline"]
+            summarized["pipeline"] = {
+                "master_changed": value["master_changed"],
+                "core_change_count": len(value["core_changes"]),
+            }
+        if "resources" in selected_sections:
+            value = debug_comparison["resource_pointers"]
+            summarized["resource_pointers"] = {
+                "added_count": len(value["added"]),
+                "removed_count": len(value["removed"]),
+                "changed_count": len(value["changed"]),
+            }
+        if "threads" in selected_sections:
+            summarized["thread_change_count"] = len(
+                debug_comparison["thread_changes"]
+            )
+        if "allocations" in selected_sections:
+            value = debug_comparison["allocations"]
+            summarized["allocations"] = {
+                "left_count": value["left_count"],
+                "right_count": value["right_count"],
+                "added_count": len(value["added"]),
+                "removed_count": len(value["removed"]),
+                "changed_count": len(value["changed"]),
+            }
+        postmortem_view = summarized
+    gpu_summary = {
+        "left_bif": comparison["left_bif"],
+        "right_bif": comparison["right_bif"],
+        "change_counts": {
+            "header": len(comparison["header_changes"]),
+            "master_register": len(comparison["master_changes"]),
+            "per_core_register": len(comparison["per_core_changes"]),
+            "indexed_state": len(comparison["indexed_state_changes"]),
+            "context_owner": len(comparison["context_owner_changes"]),
+            "driver_state": len(comparison["driver_state_changes"]),
+        },
+        "unfiltered_change_counts": unfiltered_change_counts,
+        "register_filter_applied": matcher is not None,
+        "context_slot_map_changed": comparison["context_slot_map_changed"],
+    }
     result = {
+        "schema_version": 1,
+        "command": "compare",
         "left": {"path": str(left_core.path), "sha256": left_core.raw_file_sha256},
         "right": {"path": str(right_core.path), "sha256": right_core.raw_file_sha256},
-        "gpu": comparison,
+        "selected_sections": sorted(selected_sections),
+        "summary_only": args.summary_only,
+        "register_details": raw_registers and not args.summary_only,
+        "matching": args.matching,
+        "gpu": comparison if raw_registers and not args.summary_only else gpu_summary,
+        "postmortem": postmortem_view,
     }
     if args.json:
         json.dump(result, sys.stdout, indent=2, sort_keys=True)
@@ -1527,40 +3147,221 @@ def command_compare(args: argparse.Namespace) -> int:
         f"BIF: {comparison['left_bif']['classification']} -> "
         f"{comparison['right_bif']['classification']}"
     )
-    print(f"Header changes: {len(comparison['header_changes'])}")
-    for item in comparison["header_changes"]:
-        print(f"  word{item['word']}: {item['left']:08x} -> {item['right']:08x}")
-    print(f"Master register changes: {len(comparison['master_changes'])}")
-    for item in comparison["master_changes"]:
-        name = item["name"] or f"REG_{item['offset']:04X}"
-        print(f"  {item['offset']:04x} {_hex(item['left'])} -> {_hex(item['right'])} {name}")
-    print(f"Per-core register changes: {len(comparison['per_core_changes'])}")
-    for item in comparison["per_core_changes"]:
-        name = item["name"] or f"REG_{item['offset']:04X}"
-        old = " ".join(f"{value:08x}" for value in (item["left"] or []))
-        new = " ".join(f"{value:08x}" for value in (item["right"] or []))
-        print(f"  {item['offset']:04x} [{old}] -> [{new}] {name}")
-    print(f"Indexed state changes: {len(comparison['indexed_state_changes'])}")
-    if args.show_indexed:
-        for item in comparison["indexed_state_changes"]:
-            old = " ".join(f"{value:08x}" for value in item["left"])
-            new = " ".join(f"{value:08x}" for value in item["right"])
-            print(f"  {item['index']:04x} [{old}] -> [{new}]")
-    print(f"GPU context-owner changes: {len(comparison['context_owner_changes'])}")
-    for item in comparison["context_owner_changes"]:
-        old = item["left"]
-        new = item["right"]
-        old_text = (
-            f"{_hex(old['process_id'])} {old['process_name']}" if old else "missing"
+    if "verdict" in selected_sections:
+        verdict = debug_comparison["verdict"]
+        print(
+            f"Verdict: {verdict['left_classification']} -> "
+            f"{verdict['right_classification']} "
+            f"(bucket changed={str(verdict['changed']).lower()})"
         )
-        new_text = (
-            f"{_hex(new['process_id'])} {new['process_name']}" if new else "missing"
+    if "faults" in selected_sections:
+        fault_changes = debug_comparison["fault_groups"]
+        print(
+            f"Fault groups: +{len(fault_changes['added'])} "
+            f"-{len(fault_changes['removed'])} "
+            f"~{len(fault_changes['changed'])}"
         )
-        print(f"  slot{item['slot']}: {old_text} -> {new_text}")
-    print(
-        f"Context-slot map changed: {int(comparison['context_slot_map_changed'])}; "
-        f"driver-state words changed: {len(comparison['driver_state_changes'])}"
-    )
+        if not args.summary_only:
+            for direction, items in (
+                ("+", fault_changes["added"]),
+                ("-", fault_changes["removed"]),
+            ):
+                for item in items:
+                    print(
+                        f"  {direction} page={_hex(item['gpu_virtual_address'])} "
+                        f"requestor={','.join(item['requestor_names']) or 'none'} "
+                        f"context={item['context_id']} scopes={','.join(item['scopes'])}"
+                    )
+    if "contexts" in selected_sections:
+        context_changes = debug_comparison["context_assignment_changes"]
+        print(f"Context assignment changes: {len(context_changes)}")
+        if not args.summary_only:
+            for item in context_changes:
+                def context_text(value: Optional[dict]) -> str:
+                    if value is None:
+                        return "missing"
+                    owner = value.get("owner")
+                    if owner is None:
+                        return f"{value['status']} slots={value['candidate_slots']}"
+                    return (
+                        f"slot{owner['slot']} {owner['process_name'] or '<unnamed>'} "
+                        f"pid={_hex(owner['process_id'])} ({value['status']})"
+                    )
+
+                print(
+                    f"  CID {item['context_id']}: {context_text(item['left'])} -> "
+                    f"{context_text(item['right'])}"
+                )
+    if "pipeline" in selected_sections:
+        pipeline_change = debug_comparison["pipeline"]
+        print(
+            "Pipeline changes: "
+            f"master={str(pipeline_change['master_changed']).lower()} "
+            f"cores={len(pipeline_change['core_changes'])}"
+        )
+        if not args.summary_only:
+            if pipeline_change["master_changed"]:
+                print(
+                    f"  master: {pipeline_change['left_master']} -> "
+                    f"{pipeline_change['right_master']}"
+                )
+            for change in pipeline_change["core_changes"]:
+                left_core = change["left"] or {}
+                right_core = change["right"] or {}
+                print(f"  core{change['core']}:")
+                for key, label in (
+                    ("active_phases", "phases"),
+                    ("active_units", "units"),
+                    ("draw_counters", "draw-counters"),
+                    ("isp_progress", "isp-progress"),
+                    ("render_bounds", "render-bounds"),
+                    ("region_header_base", "region-headers"),
+                    ("tile_progress", "tile-progress"),
+                ):
+                    if left_core.get(key) != right_core.get(key):
+                        print(
+                            f"    {label}: {left_core.get(key)} -> "
+                            f"{right_core.get(key)}"
+                        )
+    if "resources" in selected_sections:
+        resources = debug_comparison["resource_pointers"]
+        print(
+            f"Resource pointers: +{len(resources['added'])} "
+            f"-{len(resources['removed'])} ~{len(resources['changed'])}"
+        )
+        if not args.summary_only:
+            for sign, items in (("+", resources["added"]), ("-", resources["removed"])):
+                for item in items:
+                    allocation = item.get("allocation")
+                    allocation_text = (
+                        f" {allocation['name'] or '<unnamed>'}+0x{allocation['offset']:x}"
+                        if allocation is not None
+                        else " unresolved-allocation"
+                    )
+                    print(
+                        f"  {sign} {item['code']} {_hex(item['address'])}"
+                        f"{allocation_text}"
+                    )
+            for item in resources["changed"]:
+                print(
+                    f"  ~ {item['key']}: left={item['left']} right={item['right']}"
+                )
+    if "threads" in selected_sections:
+        thread_changes = debug_comparison["thread_changes"]
+        print(f"Thread state changes: {len(thread_changes)}")
+        if not args.summary_only:
+            def thread_text(value: Optional[dict]) -> str:
+                if value is None:
+                    return "missing"
+                context = "saved" if value["register_context_live"] else "non-live"
+                return (
+                    f"[{value['index']}] {value['name'] or '<unnamed>'} "
+                    f"{value['status_name']} context={context} "
+                    f"cpu={value['current_cpu_id']} "
+                    f"pc={_hex(value['pc'])} sp={_hex(value['sp'])} "
+                    f"wait={_hex(value['wait_id'])}"
+                )
+
+            for item in thread_changes:
+                print(
+                    f"  {_hex(item['uid'])}: {thread_text(item['left'])} -> "
+                    f"{thread_text(item['right'])}"
+                )
+    if "allocations" in selected_sections:
+        allocations = debug_comparison["allocations"]
+        print(
+            f"GPU-named allocations: {allocations['left_count']} -> "
+            f"{allocations['right_count']} (+{len(allocations['added'])} "
+            f"-{len(allocations['removed'])} ~{len(allocations['changed'])})"
+        )
+        if not args.summary_only:
+            for sign, items in (
+                ("+", allocations["added"]),
+                ("-", allocations["removed"]),
+            ):
+                for item in items:
+                    print(
+                        f"  {sign} {item['base']:08x}-{item['end']:08x} "
+                        f"size=0x{item['size']:x} {item['name'] or '<unnamed>'}"
+                    )
+            for item in allocations["changed"]:
+                ignored = {
+                    "index", "name", "base", "end", "size", "committed_size"
+                }
+                changed_fields = [
+                    key
+                    for key in sorted(set(item["left"]) | set(item["right"]))
+                    if key not in ignored
+                    and item["left"].get(key) != item["right"].get(key)
+                ]
+                print(
+                    f"  ~ {item['key']['base']:08x} size=0x{item['key']['size']:x} "
+                    f"{item['key']['name']}: "
+                    + "; ".join(
+                        f"{key}={item['left'].get(key)!r}->{item['right'].get(key)!r}"
+                        for key in changed_fields
+                    )
+                )
+    if raw_registers:
+        print("\nCAPTURED GPU STATE:")
+        if matcher is not None:
+            print(f"Register filter: {args.matching!r}")
+        print(f"Header changes: {len(comparison['header_changes'])}")
+        if not args.summary_only and matcher is None:
+            for item in comparison["header_changes"]:
+                print(
+                    f"  word{item['word']}: {item['left']:08x} -> "
+                    f"{item['right']:08x}"
+                )
+        print(f"Master register changes: {len(comparison['master_changes'])}")
+        if not args.summary_only:
+            for item in comparison["master_changes"]:
+                name = item["name"] or f"REG_{item['offset']:04X}"
+                print(
+                    f"  {item['offset']:04x} {_hex(item['left'])} -> "
+                    f"{_hex(item['right'])} {name}"
+                )
+        print(f"Per-core register changes: {len(comparison['per_core_changes'])}")
+        if not args.summary_only:
+            for item in comparison["per_core_changes"]:
+                name = item["name"] or f"REG_{item['offset']:04X}"
+                old = " ".join(f"{value:08x}" for value in (item["left"] or []))
+                new = " ".join(f"{value:08x}" for value in (item["right"] or []))
+                print(f"  {item['offset']:04x} [{old}] -> [{new}] {name}")
+        print(f"Indexed state changes: {len(comparison['indexed_state_changes'])}")
+        if not args.summary_only and args.show_indexed:
+            for item in comparison["indexed_state_changes"]:
+                old = " ".join(f"{value:08x}" for value in item["left"])
+                new = " ".join(f"{value:08x}" for value in item["right"])
+                name = item["name"] or f"SELECTOR_{item['index']:02X}"
+                print(f"  {item['index']:04x} [{old}] -> [{new}] {name}")
+        print(f"GPU context-owner changes: {len(comparison['context_owner_changes'])}")
+        if not args.summary_only and matcher is None:
+            for item in comparison["context_owner_changes"]:
+                old = item["left"]
+                new = item["right"]
+                old_text = (
+                    f"{_hex(old['process_id'])} {old['process_name']}"
+                    if old
+                    else "missing"
+                )
+                new_text = (
+                    f"{_hex(new['process_id'])} {new['process_name']}"
+                    if new
+                    else "missing"
+                )
+                print(f"  slot{item['slot']}: {old_text} -> {new_text}")
+        print(
+            f"Context-slot map changed: {int(comparison['context_slot_map_changed'])}; "
+            f"driver-state words changed: {len(comparison['driver_state_changes'])}"
+        )
+    else:
+        counts = gpu_summary["change_counts"]
+        print(
+            "Captured GPU state changes: "
+            f"master={counts['master_register']} per-core={counts['per_core_register']} "
+            f"indexed={counts['indexed_state']} (use --registers for details)"
+        )
     return 0
 
 
@@ -1568,9 +3369,46 @@ def command_memory(args: argparse.Namespace) -> int:
     core = CoreDump.read(args.dump)
     data = core.read_memory(args.address, args.size)
     block = core.memory_block_for(args.address)
+    if args.output is not None and args.json:
+        raise ParseError("--output and --json are mutually exclusive")
     if args.output is not None:
         args.output.write_bytes(data)
         print(f"wrote {len(data)} bytes from 0x{args.address:08x} to {args.output}")
+        return 0
+    if args.json:
+        json.dump(
+            {
+                "schema_version": 1,
+                "command": "memory",
+                "path": str(core.path),
+                "address": args.address,
+                "size": len(data),
+                "bytes_hex": data.hex(),
+                "ascii": "".join(
+                    chr(value) if 32 <= value < 127 else "." for value in data
+                ),
+                "u32": [
+                    {
+                        "address": args.address + offset,
+                        "value": struct.unpack_from("<I", data, offset)[0],
+                    }
+                    for offset in range(0, len(data) - 3, 4)
+                ],
+                "memory_block": (
+                    {
+                        **block.summary(),
+                        "end": block.end,
+                        "offset": args.address - block.base,
+                    }
+                    if block is not None
+                    else None
+                ),
+            },
+            sys.stdout,
+            indent=2,
+            sort_keys=True,
+        )
+        print()
         return 0
     if block:
         print(f"memory block: {block.name} [{block.base:08x}, {block.end:08x})")
@@ -1648,6 +3486,14 @@ def command_segments(args: argparse.Namespace) -> int:
 
 
 def command_tty(args: argparse.Namespace) -> int:
+    if args.tail is not None and args.tail < 0:
+        raise ParseError("--tail cannot be negative")
+    if args.raw and (args.tail is not None or args.matching):
+        raise ParseError("--tail and --matching cannot be combined with --raw")
+    try:
+        matcher = re.compile(args.matching, re.IGNORECASE) if args.matching else None
+    except re.error as exc:
+        raise ParseError(f"invalid --matching regular expression: {exc}") from exc
     core = CoreDump.read(args.dump)
     names = (args.note,) if args.note != "all" else ("TTY_INFO2", "TTY_INFO")
     decoded = []
@@ -1664,17 +3510,53 @@ def command_tty(args: argparse.Namespace) -> int:
             raise ParseError("--raw requires one explicit --note")
         sys.stdout.buffer.write(decoded[0][1].payload)
         return 0
+
+    def selected_lines(info: TtyInfo):
+        lines = list(info.lines(args.preserve_ansi))
+        matched = [line for line in lines if matcher is None or matcher.search(line.text)]
+        if args.tail is not None:
+            matched = matched[-args.tail :] if args.tail else []
+        return lines, matched
+
     if args.json:
+        result = {}
+        for name, info in decoded:
+            summary = info.summary(preserve_ansi=args.preserve_ansi)
+            if args.tail is not None or matcher is not None:
+                lines, selected = selected_lines(info)
+                summary["text"] = (
+                    "\n".join(line.text for line in selected) + ("\n" if selected else "")
+                )
+                summary["timeline"]["lines"] = [line.summary() for line in selected]
+                summary["selection"] = {
+                    "matching": args.matching,
+                    "tail": args.tail,
+                    "original_line_count": len(lines),
+                    "selected_line_count": len(selected),
+                }
+            result[name] = summary
         json.dump(
-            {
-                name: info.summary(preserve_ansi=args.preserve_ansi)
-                for name, info in decoded
-            },
+            result,
             sys.stdout,
             indent=2,
             sort_keys=True,
         )
         print()
+        return 0
+    if args.tail is not None or matcher is not None:
+        selected_by_note = [
+            (name, selected_lines(info)[1]) for name, info in decoded
+        ]
+        selected_by_note = [item for item in selected_by_note if item[1]]
+        if not selected_by_note:
+            print("No TTY lines matched the requested selection.")
+            return 0
+        for index, (name, lines) in enumerate(selected_by_note):
+            if len(selected_by_note) > 1:
+                if index:
+                    print()
+                print(f"== {name} ==")
+            print("\n".join(line.text for line in lines))
         return 0
     nonempty = [(name, info) for name, info in decoded if info.text(args.preserve_ansi)]
     selected = nonempty or decoded
@@ -1747,25 +3629,281 @@ def build_parser() -> argparse.ArgumentParser:
     )
     analyze.set_defaults(handler=command_analyze)
 
+    address = subparsers.add_parser(
+        "address",
+        help="resolve a CPU or GPU virtual address against retained dump evidence",
+    )
+    address.add_argument("dump", type=Path)
+    address.add_argument("address", type=_number)
+    address.add_argument(
+        "--bytes",
+        type=_number,
+        default=64,
+        metavar="N",
+        help="maximum captured bytes to display (default: 64)",
+    )
+    address.add_argument(
+        "--image",
+        "--elf",
+        "--self",
+        dest="images",
+        action="append",
+        default=[],
+        type=Path,
+        metavar="PATH",
+        help="identity-checked original ELF or decrypted/fake SELF (repeatable)",
+    )
+    address.add_argument("--sdk", type=Path, metavar="PATH")
+    address.add_argument("--json", action="store_true")
+    address.set_defaults(handler=command_address)
+
+    address_map = subparsers.add_parser(
+        "map", help="show the unified retained address map"
+    )
+    address_map.add_argument("dump", type=Path)
+    address_map.add_argument(
+        "--captured-only",
+        action="store_true",
+        help="omit ranges represented only by metadata",
+    )
+    address_map.add_argument(
+        "--unique",
+        action="store_true",
+        help="show one PT_LOAD entry from each exact alias group",
+    )
+    address_map.add_argument("--json", action="store_true")
+    address_map.set_defaults(handler=command_map)
+
+    modules = subparsers.add_parser(
+        "modules", help="list captured process modules and segment coverage"
+    )
+    modules.add_argument("dump", type=Path)
+    modules.add_argument("--json", action="store_true")
+    modules.set_defaults(handler=command_modules)
+
+    module = subparsers.add_parser(
+        "module", help="inspect one captured module by UID, index, or name"
+    )
+    module.add_argument("dump", type=Path)
+    module.add_argument("module", help="module UID, table index, or unique name")
+    module.add_argument(
+        "--image",
+        "--elf",
+        "--self",
+        dest="images",
+        action="append",
+        default=[],
+        type=Path,
+        metavar="PATH",
+        help="identity-checked original ELF or decrypted/fake SELF (repeatable)",
+    )
+    module.add_argument("--sdk", type=Path, metavar="PATH")
+    module.add_argument(
+        "--imports",
+        action="store_true",
+        help="include every imported-function record in image JSON",
+    )
+    module.add_argument("--json", action="store_true")
+    module.set_defaults(handler=command_module)
+
+    xref = subparsers.add_parser(
+        "xref", help="find and classify retained references to an address"
+    )
+    xref.add_argument("dump", type=Path)
+    xref.add_argument("address", type=_number)
+    xref.add_argument(
+        "--max-results", type=int, default=256, metavar="N",
+        help="memory references to return (default: 256)",
+    )
+    xref.add_argument("--json", action="store_true")
+    xref.set_defaults(handler=command_xref)
+
+    threads = subparsers.add_parser(
+        "threads", help="list retained CPU thread state"
+    )
+    threads.add_argument("dump", type=Path)
+    threads.add_argument("--json", action="store_true")
+    threads.set_defaults(handler=command_threads)
+
+    thread = subparsers.add_parser(
+        "thread", help="inspect one retained CPU thread by UID, index, or name"
+    )
+    thread.add_argument("dump", type=Path)
+    thread.add_argument("thread", help="thread UID, table index, or unique name")
+    thread.add_argument(
+        "--stack-bytes",
+        type=_number,
+        default=256,
+        metavar="N",
+        help="maximum captured bytes to show from SP (default: 256)",
+    )
+    thread.add_argument(
+        "--image",
+        "--elf",
+        "--self",
+        dest="images",
+        action="append",
+        default=[],
+        type=Path,
+        metavar="PATH",
+        help="identity-checked original ELF or decrypted/fake SELF (repeatable)",
+    )
+    thread.add_argument("--sdk", type=Path, metavar="PATH")
+    thread.add_argument(
+        "--max-frames",
+        type=int,
+        default=32,
+        metavar="N",
+        help="maximum verified ARM EHABI frames when images are supplied (default: 32)",
+    )
+    thread.add_argument("--json", action="store_true")
+    thread.set_defaults(handler=command_thread)
+
+    waits = subparsers.add_parser(
+        "waits", help="show retained thread waits, owners, chains, and cycles"
+    )
+    waits.add_argument("dump", type=Path)
+    waits.add_argument("--json", action="store_true")
+    waits.set_defaults(handler=command_waits)
+
+    object_command = subparsers.add_parser(
+        "object", help="inspect one retained kernel synchronization object"
+    )
+    object_command.add_argument("dump", type=Path)
+    object_command.add_argument("uid", type=_number)
+    object_command.add_argument("--json", action="store_true")
+    object_command.set_defaults(handler=command_object)
+
+    search = subparsers.add_parser(
+        "search", help="search bytes retained in PT_LOAD segments"
+    )
+    search.add_argument("dump", type=Path)
+    pattern = search.add_mutually_exclusive_group(required=True)
+    pattern.add_argument("--u8", type=_number, metavar="VALUE")
+    pattern.add_argument("--u16", type=_number, metavar="VALUE")
+    pattern.add_argument("--u32", type=_number, metavar="VALUE")
+    pattern.add_argument("--pointers-to", type=_number, metavar="ADDRESS")
+    pattern.add_argument("--bytes", dest="bytes_pattern", metavar="HEX")
+    pattern.add_argument("--string", metavar="TEXT")
+    search.add_argument(
+        "--encoding", default="utf-8", help="encoding used by --string (default: utf-8)"
+    )
+    search.add_argument(
+        "--alignment",
+        type=_number,
+        metavar="N",
+        help="address alignment; numeric searches default to their value width",
+    )
+    search.add_argument(
+        "--max-results", type=int, default=64, metavar="N", help="results to return (default: 64)"
+    )
+    search.add_argument(
+        "--include-aliases",
+        action="store_true",
+        help="search exact duplicate PT_LOAD aliases separately",
+    )
+    search.add_argument("--json", action="store_true")
+    search.set_defaults(handler=command_search)
+
+    gpu = subparsers.add_parser(
+        "gpu", help="inspect one focused area of retained GPU state"
+    )
+    gpu_views = gpu.add_subparsers(dest="view", required=True)
+    gpu_view_parsers = {}
+    for view, help_text in (
+        ("faults", "show BIF faults and fault-address evidence"),
+        ("contexts", "show context owners and context-slot assignments"),
+        ("pipeline", "show firmware-decoded pipeline progress"),
+        ("resources", "show retained GPU resource pointers and named allocations"),
+    ):
+        view_parser = gpu_views.add_parser(view, help=help_text)
+        view_parser.add_argument("dump", type=Path)
+        view_parser.add_argument("--json", action="store_true")
+        view_parser.set_defaults(handler=command_gpu)
+        gpu_view_parsers[view] = view_parser
+    gpu_view_parsers["pipeline"].add_argument(
+        "--core",
+        dest="cores",
+        action="append",
+        type=int,
+        metavar="N",
+        help="limit output to one GPU core (repeatable)",
+    )
+    gpu_view_parsers["pipeline"].add_argument(
+        "--details",
+        action="store_true",
+        help="include retained counters, tiles, surfaces, and register fields",
+    )
+    gpu_view_parsers["resources"].add_argument(
+        "--allocations",
+        action="store_true",
+        help="list every selected GPU-named allocation range",
+    )
+
     registers = subparsers.add_parser("registers", help="print captured GPU registers")
     registers.add_argument("dump", type=Path)
     registers.add_argument("--matching", help="case-insensitive name/offset regex")
     registers.add_argument("--show-zero", action="store_true")
     registers.add_argument("--indexed", action="store_true", help="include undocumented indexed state")
+    registers.add_argument("--json", action="store_true")
     registers.set_defaults(handler=command_registers)
 
-    compare = subparsers.add_parser("compare", help="compare two GPU register snapshots")
+    triage = subparsers.add_parser(
+        "triage", help="group and facet multiple fixed-format GPUCRASH dumps"
+    )
+    triage.add_argument("dumps", nargs="+", type=Path)
+    triage.add_argument("--json", action="store_true")
+    triage.set_defaults(handler=command_triage)
+
+    compare = subparsers.add_parser("compare", help="compare two GPU crash snapshots")
     compare.add_argument("left", type=Path)
     compare.add_argument("right", type=Path)
     compare.add_argument("--json", action="store_true")
-    compare.add_argument("--show-indexed", action="store_true")
+    compare.add_argument(
+        "--summary-only",
+        action="store_true",
+        help="show section counts without individual changed records",
+    )
+    compare.add_argument(
+        "--section",
+        dest="sections",
+        action="append",
+        default=[],
+        metavar="NAME",
+        help=(
+            "limit semantic output to verdict, faults, contexts, pipeline, "
+            "resources, threads, or allocations (repeatable or comma-separated)"
+        ),
+    )
+    compare.add_argument(
+        "--registers",
+        action="store_true",
+        help="include changed GPU header, register, indexed, and trailer state",
+    )
+    compare.add_argument(
+        "--matching",
+        help="include register details matching a case-insensitive name/offset regex",
+    )
+    compare.add_argument(
+        "--show-indexed",
+        action="store_true",
+        help="print individual indexed-state rows (implies --registers)",
+    )
     compare.set_defaults(handler=command_compare)
+
+    validate = subparsers.add_parser(
+        "validate", help="check the fixed Vita GPUCRASH producer invariants"
+    )
+    validate.add_argument("dump", type=Path)
+    validate.add_argument("--json", action="store_true")
+    validate.set_defaults(handler=command_validate)
 
     memory = subparsers.add_parser("memory", help="hex-dump a captured virtual range")
     memory.add_argument("dump", type=Path)
     memory.add_argument("address", type=_number)
     memory.add_argument("size", type=_number)
     memory.add_argument("--output", type=Path, help="write bytes to a file instead of hex-dumping")
+    memory.add_argument("--json", action="store_true")
     memory.set_defaults(handler=command_memory)
 
     activity = subparsers.add_parser(
@@ -1803,6 +3941,17 @@ def build_parser() -> argparse.ArgumentParser:
         "--preserve-ansi",
         action="store_true",
         help="retain console ANSI escape sequences in decoded text",
+    )
+    tty.add_argument(
+        "--tail",
+        type=int,
+        metavar="N",
+        help="show only the last N selected non-empty lines",
+    )
+    tty.add_argument(
+        "--matching",
+        metavar="REGEX",
+        help="show only lines matching a case-insensitive regular expression",
     )
     tty.set_defaults(handler=command_tty)
     return parser

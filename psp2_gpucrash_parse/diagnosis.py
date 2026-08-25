@@ -63,6 +63,32 @@ _STATUS2_MARKERS = (
 
 _DIRECTORY_OFFSETS = (0x0C84, 0x0C38, 0x0C3C, 0x0C40, 0x0C44, 0x0C48, 0x0C4C, 0x0C50)
 
+# Retained execution/resource pointers with unambiguous address masks in the
+# SGX543 register definitions.  These are correlated numerically with
+# MEM_BLK_INFO; the match does not substitute for an SGX MMU page walk.
+_RESOURCE_POINTER_REGISTERS = (
+    (True, 0x4238, 0xFFFFFFFC, "vdm-control-stream", "VDM control stream", "vertex"),
+    (False, 0x0238, 0xFFFFFFFC, "vdm-control-stream", "VDM control stream", "vertex"),
+    (
+        True,
+        0x4334,
+        0xFFFFFFFC,
+        "vdm-context-store-stream",
+        "VDM context-store stream",
+        "vertex",
+    ),
+    (
+        False,
+        0x0334,
+        0xFFFFFFFC,
+        "vdm-context-store-stream",
+        "VDM context-store stream",
+        "vertex",
+    ),
+    (False, 0x0A5C, 0xFFFFFFF0, "pixel-pds-exec", "Pixel PDS executable", "fragment"),
+    (False, 0x0A68, 0xFFFFFFF0, "other-pds-exec", "Other-event PDS executable", "shared"),
+)
+
 _LOG_CLUE = re.compile(
     r"\b(?:abort|assert|deadlock|error|fail(?:ed|ure)?|fault|hang|invalid|mismatch|"
     r"out[- ]of[- ]memory|oom|panic|stall|timeout|watchdog)\b",
@@ -164,11 +190,23 @@ def _address_register_references(
 ) -> List[dict]:
     if address == 0:
         return []
+
+    def matching_fields(offset: int, master: bool, value: int) -> List[str]:
+        definition = database.definition(offset, master=master)
+        if definition is None:
+            return []
+        return [
+            field.name
+            for field in definition.fields
+            if field.is_address and field.address(value) & 0xFFFFF000 == address
+        ]
+
     references = []
     for register in info.master_registers:
         if register.offset == 0x4C08:
             continue
-        if register.value & 0xFFFFF000 == address:
+        fields = matching_fields(register.offset, True, register.value)
+        if fields:
             references.append(
                 {
                     "scope": "master",
@@ -176,16 +214,17 @@ def _address_register_references(
                     "offset": register.offset,
                     "value": register.value,
                     "name": _register_name(database, register.offset, master=True),
+                    "address_fields": fields,
                 }
             )
     for register in info.per_core_registers:
         if register.offset == 0x0C08:
             continue
-        cores = [
-            index
+        matches = [
+            (index, matching_fields(register.offset, False, value))
             for index, value in enumerate(register.values)
-            if value & 0xFFFFF000 == address
         ]
+        cores = [index for index, fields in matches if fields]
         if cores:
             references.append(
                 {
@@ -194,6 +233,13 @@ def _address_register_references(
                     "offset": register.offset,
                     "values": [register.values[index] for index in cores],
                     "name": _register_name(database, register.offset, master=False),
+                    "address_fields": list(
+                        dict.fromkeys(
+                            field
+                            for _, fields in matches
+                            for field in fields
+                        )
+                    ),
                 }
             )
     return references
@@ -282,6 +328,56 @@ def _fault_evidence(
             }
         )
         result.append(item)
+    return result
+
+
+def _fault_groups(faults: Sequence[dict]) -> List[dict]:
+    grouped: dict[tuple, dict] = {}
+    for index, fault in enumerate(faults):
+        owner = fault["context_attribution"]["owner"]
+        owner_process_id = owner["process_id"] if owner is not None else None
+        key = (
+            fault["gpu_virtual_address"],
+            fault["requestor"],
+            fault["fault_type"],
+            fault["context_id"],
+            fault["page_directory_base"],
+            owner_process_id,
+            fault["status_latched"],
+        )
+        group = grouped.get(key)
+        if group is None:
+            group = {
+                "index": len(grouped),
+                "gpu_virtual_address": fault["gpu_virtual_address"],
+                "null_address": fault["null_address"],
+                "requestor": fault["requestor"],
+                "requestor_names": list(fault["requestor_names"]),
+                "requestor_details": list(fault["requestor_details"]),
+                "fault_type": fault["fault_type"],
+                "fault_conditions": list(fault["fault_conditions"]),
+                "context_id": fault["context_id"],
+                "context_attribution": fault["context_attribution"],
+                "page_directory_base": fault["page_directory_base"],
+                "status_latched": fault["status_latched"],
+                "source_indices": [],
+                "scopes": [],
+                "sidebands": [],
+                "fault_register_values": [],
+            }
+            grouped[key] = group
+        group["source_indices"].append(index)
+        if fault["scope"] not in group["scopes"]:
+            group["scopes"].append(fault["scope"])
+        if fault["sideband"] not in group["sidebands"]:
+            group["sidebands"].append(fault["sideband"])
+        if fault["fault"] not in group["fault_register_values"]:
+            group["fault_register_values"].append(fault["fault"])
+    result = list(grouped.values())
+    for group in result:
+        group["source_count"] = len(group["source_indices"])
+        group["multiple_scope_observation"] = len(group["scopes"]) > 1
+        group["sidebands"].sort()
     return result
 
 
@@ -500,6 +596,88 @@ def _allocation_evidence(core: CoreDump) -> dict:
     }
 
 
+def _resource_pointer_evidence(core: CoreDump, info: GpuInfo) -> dict:
+    grouped: dict[tuple[str, int], dict] = {}
+    observation_count = 0
+    for master, offset, mask, code, name, stage in _RESOURCE_POINTER_REGISTERS:
+        if master:
+            values = [
+                ("master", None, register.value)
+                for register in info.master_registers
+                if register.offset == offset
+            ]
+        else:
+            captured = info.core_values(offset)
+            values = (
+                [("per-core", index, value) for index, value in enumerate(captured)]
+                if captured is not None
+                else []
+            )
+        for scope, core_index, raw_value in values:
+            address = raw_value & mask
+            if address == 0:
+                continue
+            observation_count += 1
+            key = (code, address)
+            pointer = grouped.get(key)
+            if pointer is None:
+                block = core.memory_block_for(address)
+                allocation = None
+                if block is not None:
+                    allocation = {
+                        "index": block.index,
+                        "uid": block.uid,
+                        "name": block.name,
+                        "base": block.base,
+                        "end": block.end,
+                        "size": block.size,
+                        "offset": address - block.base,
+                        "attributes": block.attributes,
+                        "captured_bytes": core.captured_bytes(block.base, block.end),
+                    }
+                pointer = {
+                    "index": len(grouped),
+                    "code": code,
+                    "name": name,
+                    "stage": stage,
+                    "address": address,
+                    "allocation": allocation,
+                    "captured_bytes_at_address": core.captured_bytes(
+                        address, address + 16
+                    ),
+                    "observations": [],
+                    "master_observed": False,
+                    "core_indices": [],
+                }
+                grouped[key] = pointer
+            pointer["observations"].append(
+                {
+                    "scope": scope,
+                    "core": core_index,
+                    "register_offset": offset,
+                    "raw_value": raw_value,
+                    "address_mask": mask,
+                }
+            )
+            if master:
+                pointer["master_observed"] = True
+            elif core_index not in pointer["core_indices"]:
+                pointer["core_indices"].append(core_index)
+    pointers = list(grouped.values())
+    for pointer in pointers:
+        pointer["core_indices"].sort()
+    return {
+        "selection": "retained VDM stream and PDS executable address registers",
+        "correlation": "direct numeric overlap with MEM_BLK_INFO virtual ranges",
+        "pointer_count": len(pointers),
+        "observation_count": observation_count,
+        "allocation_match_count": sum(
+            pointer["allocation"] is not None for pointer in pointers
+        ),
+        "pointers": pointers,
+    }
+
+
 def _kernel_evidence(core: CoreDump, execution: dict, support: dict) -> dict:
     registry = KernelObjectRegistry.parse(core)
     threads_by_uid = {thread["uid"]: thread for thread in execution["threads"]}
@@ -593,7 +771,10 @@ def _log_evidence(core: CoreDump) -> dict:
 
 
 def _verdict(
-    faults: List[dict], signals: List[dict], lockup_phases: List[dict]
+    faults: List[dict],
+    fault_groups: List[dict],
+    signals: List[dict],
+    lockup_phases: List[dict],
 ) -> Tuple[str, str, str, str]:
     if faults:
         active_faults = [fault for fault in faults if fault["status_latched"]]
@@ -606,6 +787,39 @@ def _verdict(
                 f"BIF fault-register state retained on {scopes}; interrupt fault status clear",
                 "BIF_FAULT is nonzero while BIF_INT_STAT.FAULT_REQ and FAULT_TYPE are "
                 "clear. Treat the address as residual state, not a confirmed active fault.",
+            )
+        active_groups = [group for group in fault_groups if group["status_latched"]]
+        null_groups = [group for group in active_groups if group["null_address"]]
+        if null_groups:
+            null_scopes = ", ".join(
+                scope for group in null_groups for scope in group["scopes"]
+            )
+            headline = (
+                f"GPU BIF/MMU null-page access fault: {null_scopes}"
+                if len(null_groups) == len(active_groups)
+                else "GPU BIF/MMU access faults, including null-page access on "
+                f"{null_scopes}"
+            )
+            return (
+                "gpu-bif-access-fault",
+                "high",
+                headline,
+                "A valid BIF fault request targets GPU virtual page zero. The retained "
+                "requestor and MMU context identify the access path; they do not identify "
+                "which command or application object supplied the null address. Other "
+                "retained fault groups remain listed separately.",
+            )
+        if len(active_groups) == 1 and active_groups[0]["multiple_scope_observation"]:
+            group = active_groups[0]
+            grouped_scopes = ", ".join(group["scopes"])
+            return (
+                "gpu-bif-access-fault",
+                "high",
+                f"GPU BIF/MMU access fault observed on {grouped_scopes}",
+                "The same GPU virtual page, requestor, MMU context, and page-directory "
+                "tuple is retained by multiple cores. This is one grouped translation "
+                "fault observation; allocation resolution still requires the SGX page "
+                "tables or a device-virtual-address allocation map.",
             )
         return (
             "gpu-bif-access-fault",
@@ -680,6 +894,12 @@ def _verdict(
     )
 
 
+def _root_cause_confidence(classification: str) -> str:
+    if classification == "gpu-dpm-memory-deadlock":
+        return "medium"
+    return "low"
+
+
 def _failure_identity(
     classification: str,
     faults: List[dict],
@@ -722,14 +942,16 @@ def build_diagnosis(
     summary_info: Optional[SummaryInfo] = None,
 ) -> dict:
     faults = _fault_evidence(core, info, database)
+    fault_groups = _fault_groups(faults)
     signals = _event_signals(info)
     lockup_phases = _lockup_phases(info)
     pipeline_markers = _pipeline_markers(info)
     pipeline = firmware_pipeline_diagnosis(info)
     _enrich_pipeline_addresses(core, pipeline)
     classification, confidence, headline, explanation = _verdict(
-        faults, signals, lockup_phases
+        faults, fault_groups, signals, lockup_phases
     )
+    root_cause_confidence = _root_cause_confidence(classification)
     failure_bucket, failure_hash = _failure_identity(
         classification, faults, signals, lockup_phases
     )
@@ -753,6 +975,7 @@ def build_diagnosis(
         )
     kernel = _kernel_evidence(core, execution, support)
     allocations = _allocation_evidence(core)
+    resource_pointers = _resource_pointer_evidence(core, info)
     summary = summary_info.summary(core.notes) if summary_info is not None else None
     activity_state = (
         "unavailable"
@@ -780,9 +1003,12 @@ def build_diagnosis(
         "classification": classification,
         "analysis_code": classification.upper().replace("-", "_"),
         "confidence": confidence,
+        "classification_confidence": confidence,
+        "root_cause_confidence": root_cause_confidence,
         "headline": headline,
         "explanation": explanation,
         "fault_sources": faults,
+        "fault_groups": fault_groups,
         "event_signals": signals,
         "lockup_phases": lockup_phases,
         "pipeline_markers": pipeline_markers,
@@ -797,6 +1023,7 @@ def build_diagnosis(
         "memory_evidence": memory,
         "note_coverage": _note_coverage(core),
         "allocation_evidence": allocations,
+        "resource_pointers": resource_pointers,
         "execution_context": execution,
         "kernel_objects": kernel,
         "supporting_context": support,
@@ -807,9 +1034,26 @@ def build_diagnosis(
         "failure_bucket_id": failure_bucket,
         "failure_hash": failure_hash,
         "recommended_commands": [
+            f"psp2-gpucrash-parse gpu faults {quoted}",
+            f"psp2-gpucrash-parse gpu pipeline {quoted}",
+            f"psp2-gpucrash-parse gpu resources {quoted}",
+            f"psp2-gpucrash-parse threads {quoted}",
+            f"psp2-gpucrash-parse waits {quoted}",
+            f"psp2-gpucrash-parse map {quoted} --captured-only --unique",
+            *(
+                [
+                    f"psp2-gpucrash-parse address {quoted} "
+                    f"0x{fault_groups[0]['gpu_virtual_address']:08x}",
+                    f"psp2-gpucrash-parse xref {quoted} "
+                    f"0x{fault_groups[0]['gpu_virtual_address']:08x}",
+                ]
+                if fault_groups
+                else []
+            ),
             f"psp2-gpucrash-parse tty {quoted}",
             f"psp2-gpucrash-parse registers {quoted} --matching 'BIF|EVENT|VDM|DPM|ISP'",
             f"psp2-gpucrash-parse segments {quoted} --unique",
+            f"psp2-gpucrash-parse validate {quoted}",
             f"psp2-gpucrash-parse compare {quoted} KNOWN_GOOD.psp2dmp",
         ],
     }
