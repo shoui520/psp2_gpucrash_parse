@@ -22,6 +22,7 @@ from .debugger import (
     thread_list_report,
 )
 from .diagnosis import build_diagnosis
+from .devkit import DevkitGpuDump, correlate_gpu_dump
 from .elfimage import enrich_address_with_elfs, enrich_diagnosis_with_elfs
 from .gpu import GpuInfo, compare_gpu_info
 from .indexed import indexed_selector_metadata
@@ -1025,6 +1026,8 @@ def _print_fault_records(diagnosis: dict) -> None:
             + (", ".join(group["requestor_names"]) or "none")
         )
         _print_requestor_details(group["requestor_details"])
+        print("    Fault condition        : " + (", ".join(group["fault_conditions"]) or "none"))
+        print(f"    Page access            : {group['page_access_type']}")
         print(f"    MMU context            : {group['context_id']}")
         print(f"    Page directory         : {_hex(group['page_directory_base'])}")
         print(
@@ -1059,6 +1062,8 @@ def _print_fault_records(diagnosis: dict) -> None:
         )
         _print_requestor_details(fault["requestor_details"])
         print(f"    Hardware fault type    : {fault['fault_type']}")
+        print(f"    Raw fault type         : {fault['fault_type_raw']} (includes access selector)")
+        print(f"    Page access            : {fault['page_access_type']}")
         print(
             "    Fault conditions       : "
             + (", ".join(fault["fault_conditions"]) or "none")
@@ -1129,6 +1134,8 @@ def _print_requestor_details(details: list[dict]) -> None:
             f"    Request path           : bit {item['bit']} "
             f"({item['code']}): {item['interpretation']}"
         )
+        if item.get("subunit_name"):
+            print(f"    Requestor subunit      : {item['subunit_id']} ({item['subunit_name']})")
 
 
 def _print_bif_register_state(info: GpuInfo) -> None:
@@ -1228,6 +1235,11 @@ def _print_firmware_pipeline_diagnostics(
         )
         print(f"        Active phases     : {phases}")
         print(f"        Active units      : {units}")
+        for pipe in core["usse_data_master_usage"]:
+            print(
+                f"        USSE pipe {pipe['pipe']}       : {pipe['usage']} "
+                f"raw={_hex(pipe['raw_value'])}"
+            )
         if not core["active_phases"]:
             print("        No vertex/fragment activity bit was retained for this core.")
             continue
@@ -1240,10 +1252,11 @@ def _print_firmware_pipeline_diagnostics(
                     "            "
                     + "  ".join(
                         f"{item['name']}={item['draw_number']}"
+                        + (f"(counter={item['counter_value']})" if item["encoding"] == "zero-or-draw-plus-one" else "")
                         for item in counters[base : base + 4]
                     )
                 )
-            print("        Counter checks    :")
+            print("        Counter checks    : raw counter fields")
             for check in core["draw_counter_checks"]:
                 values = ", ".join(
                     f"{name}={value}" for name, value in check["values"].items()
@@ -1323,6 +1336,8 @@ def _print_firmware_pipeline_diagnostics(
                         f"[{_address_capture_text(surface['address_evidence'])}]"
                     )
     print("\n    Draw numbers are 13-bit retained counters; equality does not imply completion.")
+    print("    MTE/VDM display zero or counter-1; ISP/TSP display the counter directly.")
+    print("    USSE slots: V=vertex, P=fragment, .=idle, S=service; slot 0 is printed first.")
     print("    Tile positions are progress markers in 16x16-pixel units, not fault locations.")
     print("    MEM_BLK matches are direct address overlaps; they do not prove GPU-MMU ownership.")
 
@@ -1388,6 +1403,7 @@ def _compact_firmware_pipeline(pipeline: dict, cores: Sequence[int]) -> dict:
                     "unit_value",
                     "active_phases",
                     "active_units",
+                    "usse_data_master_usage",
                     "draw_counter_checks",
                     "tile_checks",
                     "isp_progress",
@@ -1738,6 +1754,142 @@ def _print_failure_identity(diagnosis: dict) -> None:
     print(f"FAILURE_HASH:       {diagnosis['failure_hash']}")
 
 
+def _register_value_text(value) -> str:
+    if isinstance(value, (tuple, list)):
+        return "[" + ", ".join(_hex(item) for item in value) + "]"
+    return _hex(value)
+
+
+def _print_devkit_gpu_dump(report: dict, include_registers: bool = False) -> None:
+    header = report["header"]
+    print("\nDEVKIT_GPU_DUMP:")
+    print(f"    File                  : {report['path']}")
+    print(f"    Size                  : {report['size']} bytes")
+    print(f"    SHA256                : {report['sha256']}")
+    print(f"    Format version        : {_hex(header['format_version'])}")
+    print(f"    SDK version           : {_hex(header['sdk_version'])}")
+    print(f"    GPU driver build      : {header['gpu_driver_build']} ({_hex(header['gpu_driver_build'])})")
+    print(f"    SoC revision          : {_hex(header['soc_revision'])}")
+    print(f"    GPU cores             : {report['core_count']}")
+    print("\n    Segments:")
+    for segment in report["segments"]:
+        count = f" records={segment['record_count']}" if "record_count" in segment else ""
+        print(
+            f"        {segment['tag']:08x} {segment['name']:14} "
+            f"offset=0x{segment['file_offset']:04x} size=0x{segment['stored_size']:x} "
+            f"{segment['encoding']}{count}"
+        )
+    if report["missing_segments"]:
+        print("    Missing segments      : " + ", ".join(report["missing_segments"]))
+    print("\n    Data-master processes:")
+    for process in report["processes"]:
+        if process["populated"]:
+            print(
+                f"        DM {process['data_master']}: pid={_hex(process['process_id'])} "
+                f"{process['process_name'] or '<unnamed>'}"
+            )
+        else:
+            print(f"        DM {process['data_master']}: unresolved")
+    print(f"    {report['process_table_scope']}")
+    if report["render_state"] is not None:
+        render = report["render_state"]
+        print("\n    Render state:")
+        for phase in ("vertex", "fragment"):
+            print(f"        {phase}: frame={render[phase + '_frame']} scene={render[phase + '_scene']}")
+    print("\n    Sidecar BIF faults:")
+    if not report["bif"]["fault_sources"]:
+        print("        No retained BIF fault record.")
+    for fault in report["bif"]["fault_sources"]:
+        print(
+            f"        {fault['scope']}: INT_STAT={_hex(fault['status'])} "
+            f"FAULT={_hex(fault['fault'])} page={_hex(fault['address'])} ctx={fault['context_id']}"
+        )
+        print(
+            f"            {', '.join(fault['fault_conditions']) or 'no fault-type latch'}; "
+            f"{fault['page_access_type']}; latched={str(fault['status_latched']).lower()}"
+        )
+        for detail in fault["requestor_details"]:
+            print(f"            {detail['name']}: subunit={detail['subunit_id']} ({detail['subunit_name'] or 'undecoded'})")
+    print("\n    USSE data-master slots (V=vertex, P=fragment, .=idle, S=service):")
+    for core in report["firmware_pipeline"]["cores"]:
+        for pipe in core["usse_data_master_usage"]:
+            print(
+                f"        core{core['core']} pipe{pipe['pipe']}: {pipe['usage']} "
+                f"raw={_hex(pipe['raw_value'])}"
+            )
+    correlation = report.get("correlation")
+    if correlation is not None:
+        print("\n    GPU_INFO correlation:")
+        print(f"        Core dump         : {correlation['core_path']}")
+        print(f"        Result            : {correlation['status']}")
+        print(f"        Fault signature   : {correlation['fault_signature_match']}")
+        print(f"        SoC / core count  : {correlation['soc_revision_match']} / {correlation['core_count_match']}")
+        print(f"        Matching processes: {len(correlation['matching_processes'])}")
+        for conflict in correlation["conflicting_processes"]:
+            print(f"        Process conflict  : pid={_hex(conflict['process_id'])} sidecar={conflict['process_name']} GPU_INFO={conflict['gpu_info_name']}")
+        for check in correlation["fault_process_checks"]:
+            print(
+                f"        {check['scope']} fault owner : sidecar={check['gpu_dump_name']} "
+                f"GPU_INFO={check['gpu_info_name'] or 'unresolved'} ({check['status']})"
+            )
+        for name, comparison in correlation["register_comparisons"].items():
+            print(
+                f"        {name:18}: {comparison['matching_count']}/{comparison['shared_count']} shared offsets equal; "
+                f"{len(comparison['changed'])} changed; "
+                f"sidecar-only={len(comparison['gpu_dump_only'])} GPU_INFO-only={len(comparison['gpu_info_only'])}"
+            )
+            for change in comparison["changed"]:
+                print(
+                    f"            0x{change['offset']:04x}: sidecar={_register_value_text(change['gpu_dump'])} "
+                    f"GPU_INFO={_register_value_text(change['gpu_info'])}"
+                )
+            for key, label in (("gpu_dump_only", "Sidecar only"), ("gpu_info_only", "GPU_INFO only")):
+                if comparison[key]:
+                    print(f"            {label}: " + ", ".join(f"0x{item['offset']:04x}" for item in comparison[key]))
+        hint = correlation["filename_timestamp_hint"]
+        if hint is not None:
+            print(f"        Filename time     : {hint['iso_local']}; delta={hint['delta_from_gpu_info_microseconds']} us")
+            print("        Filename time is a naming hint, not an embedded event identifier.")
+        print(f"        {correlation['qualification']}")
+        if correlation["status"] == "mismatch":
+            print("        WARNING: supplied captures disagree; sidecar state is not evidence for this core dump.")
+    if include_registers:
+        print("\n    Register tables (sidecar snapshot):")
+        for name, records in report["register_tables"].items():
+            print(f"        {name}:")
+            for record in records:
+                offset = record.get("offset", record.get("selector"))
+                value = record["value"] if "value" in record else record["values"]
+                print(f"            0x{offset:04x} {record['name'] or '-'} {_register_value_text(value)}")
+    print("\nFIRMWARE_ANALYSIS_TEXT:")
+    if report["analysis_text"]:
+        print(report["analysis_text"], end="")
+    else:
+        print("    Embedded firmware analysis text is absent or empty.")
+    print("\nDEVKIT_GPU_DUMP_LIMITATIONS:")
+    for limitation in report["limitations"]:
+        print(f"    {limitation}")
+
+
+def command_gpu_dump(args: argparse.Namespace) -> int:
+    native = DevkitGpuDump.read(args.file)
+    report = native.summary(_database(args))
+    if args.core_dump:
+        core = CoreDump.read(args.core_dump)
+        info = _gpu_info(core)
+        if info is None:
+            raise ParseError("GPU_INFO is unavailable in the supplied core dump; cannot correlate")
+        report["correlation"] = correlate_gpu_dump(native, core, info)
+    if args.json:
+        json.dump(report, sys.stdout, indent=2, sort_keys=True)
+        print()
+    elif args.text:
+        print(report["analysis_text"], end="")
+    else:
+        _print_devkit_gpu_dump(report, args.registers)
+    return 0
+
+
 def _print_diagnosis(
     core: CoreDump,
     info: GpuInfo,
@@ -1773,6 +1925,8 @@ def _print_diagnosis(
     _print_resource_pointers(diagnosis)
     _print_allocation_evidence(diagnosis)
     _print_capture_evidence(core, activity, diagnosis)
+    if diagnosis.get("gpu_dump") is not None:
+        _print_devkit_gpu_dump(diagnosis["gpu_dump"])
     if not args.no_log:
         _print_log_evidence(diagnosis, args.log_lines)
     if diagnosis["limitations"]:
@@ -1803,6 +1957,18 @@ def command_analyze(args: argparse.Namespace) -> int:
         if info is not None
         else None
     )
+    if args.gpu_dump:
+        if info is None:
+            raise ParseError("GPU_INFO is unavailable; use gpu-dump to inspect the sidecar on its own")
+        native = DevkitGpuDump.read(args.gpu_dump)
+        report = native.summary(database)
+        report["correlation"] = correlate_gpu_dump(native, core, info)
+        diagnosis["gpu_dump"] = report
+        if report["correlation"]["status"] != "consistent":
+            diagnosis["limitations"].append(
+                "Supplied GPU sidecar correlation is " + report["correlation"]["status"]
+                + "; its state must not be attributed to this GPUCRASH without independent confirmation."
+            )
     if diagnosis is not None:
         diagnosis["validation"] = validation
         diagnosis["wait_graph"] = wait_graph(core, database, diagnosis)
@@ -2420,6 +2586,7 @@ def _triage_group_synopsis(entry: dict, group_kind: str) -> str:
             fault_parts.append(
                 f"{prefix}{'/'.join(fault['requestors']) or 'no-requestor'}"
                 f"[{','.join(fault['conditions']) or 'no-condition'}]"
+                f"/{fault['page_access_type']}"
                 f"/cid={fault['context_id'] if fault['context_id'] is not None else 'unknown'}"
                 f"/scope={','.join(fault['scopes']) or 'none'}"
             )
@@ -3627,7 +3794,22 @@ def build_parser() -> argparse.ArgumentParser:
     analyze.add_argument(
         "--no-log", action="store_true", help="omit application TTY clues"
     )
+    analyze.add_argument(
+        "--gpu-dump", type=Path, metavar="PATH",
+        help="optional devkit gpu_core_dump binary; correlate without replacing GPU_INFO",
+    )
     analyze.set_defaults(handler=command_analyze)
+
+    gpu_dump = subparsers.add_parser(
+        "gpu-dump", help="decode a devkit gpu_core_dump binary, optionally correlate a GPUCRASH"
+    )
+    gpu_dump.add_argument("file", type=Path)
+    gpu_dump.add_argument("--core-dump", type=Path, metavar="PATH", help="GPUCRASH to correlate")
+    gpu_dump_output = gpu_dump.add_mutually_exclusive_group()
+    gpu_dump_output.add_argument("--json", action="store_true", help="include all decoded tables and raw diagnostic text bytes")
+    gpu_dump_output.add_argument("--text", action="store_true", help="print only the embedded firmware report")
+    gpu_dump.add_argument("--registers", action="store_true", help="include all sidecar register values in text output")
+    gpu_dump.set_defaults(handler=command_gpu_dump)
 
     address = subparsers.add_parser(
         "address",

@@ -1,5 +1,6 @@
 import unittest
 
+from psp2_gpucrash_parse.core import Note
 from psp2_gpucrash_parse.debugger import load_debug_state, thread_detail_report
 from psp2_gpucrash_parse.inspection import (
     annotated_stack,
@@ -10,12 +11,27 @@ from psp2_gpucrash_parse.inspection import (
 )
 from psp2_gpucrash_parse.registers import RegisterDatabase
 from psp2_gpucrash_parse.unwind import unwind_thread
-from psp2_gpucrash_parse.validation import validate_core
+from psp2_gpucrash_parse.validation import _REQUIRED_FIXED_NOTES, validate_core
 from psp2_gpucrash_parse.waitgraph import wait_graph
 from tests.test_debugger import dormant_execution_core, execution_core
 
 
 class InspectionTests(unittest.TestCase):
+    def test_devkit_note_profile_difference_is_not_structural_corruption(self):
+        core = execution_core()
+        present = {note.name for note in core.notes}
+        # This test concerns inventory checks only; omit decoder-specific
+        # records rather than constructing invalid bodies for them.
+        decoded = {"GPU_ACT_INFO", "SUMMARY_INFO"}
+        core.notes.extend(Note(name, 0, b"", 0) for name in sorted(
+            _REQUIRED_FIXED_NOTES - present - decoded
+        ))
+        checks = {item["code"]: item for item in validate_core(core)["checks"]}
+        self.assertEqual(checks["fixed-note-set"]["evidence"]["missing"], sorted(decoded))
+        self.assertEqual(checks["retail-note-profile"]["severity"], "warning")
+        self.assertEqual(checks["retail-note-profile"]["evidence"]["missing"],
+                         ["SYSTEM_INFO2", "TTY_INFO2"])
+
     def test_map_and_module_views_combine_metadata_with_capture_ranges(self):
         core = execution_core()
         address_map = retained_map(core)

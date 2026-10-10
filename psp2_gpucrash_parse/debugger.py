@@ -545,6 +545,9 @@ def _pipeline_core_summary(item: dict) -> dict:
         "core": item["core"],
         "active_phases": item["active_phases"],
         "active_units": [unit["code"] for unit in item["active_units"]],
+        "usse_data_master_usage": {
+            pipe["pipe"]: pipe["usage"] for pipe in item["usse_data_master_usage"]
+        },
         "draw_counters": {
             counter["code"]: counter["draw_number"]
             for counter in item["draw_counters"]
@@ -570,6 +573,7 @@ def compare_debug_state(left: dict, right: dict) -> dict:
             "gpu_virtual_address",
             "requestor",
             "fault_type",
+            "page_access_type",
             "context_id",
             "page_directory_base",
         ),

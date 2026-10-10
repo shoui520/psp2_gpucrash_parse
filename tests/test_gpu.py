@@ -1,7 +1,7 @@
 import struct
 import unittest
 
-from psp2_gpucrash_parse.gpu import GpuInfo, GpuTrailer, compare_gpu_info
+from psp2_gpucrash_parse.gpu import GpuInfo, GpuTrailer, _fault_source, compare_gpu_info
 from psp2_gpucrash_parse.registers import RegisterDatabase
 
 
@@ -22,6 +22,48 @@ def fixture(
 
 
 class GpuInfoTests(unittest.TestCase):
+    def test_bif_condition_is_an_enum_with_separate_directory_access_bit(self):
+        for raw, condition, access in (
+            (1, "Page not mapped", "Entry access"),
+            (2, "Read/write access error", "Entry access"),
+            (3, "System page access", "Entry access"),
+            (5, "Page not mapped", "Directory access"),
+            (6, "Read/write access error", "Directory access"),
+            (7, "System page access", "Directory access"),
+        ):
+            with self.subTest(raw=raw):
+                fault = _fault_source("core1", (raw << 16) | 2, 0x70001011)
+                self.assertEqual(fault["fault_type"], raw & 3)
+                self.assertEqual(fault["fault_type_raw"], raw)
+                self.assertEqual(fault["fault_conditions"], [condition])
+                self.assertEqual(fault["page_access_type"], access)
+                self.assertTrue(fault["status_latched"])
+
+    def test_directory_access_selector_and_requestor_alone_are_not_fault_latches(self):
+        fault = _fault_source("core1", 0x40002, 0x70001011)
+        self.assertFalse(fault["status_latched"])
+        self.assertEqual(fault["fault_conditions"], [])
+
+    def test_requestor_subunits_follow_firmware_tables_and_scope(self):
+        for scope, bit, subunit, name in (
+            ("core1", 1, 1, "Dependent Texture"),
+            ("core1", 1, 2, "Non-Dependent Texture"),
+            ("core1", 1, 11, "Non-Dependent Texture (Palettized)"),
+            ("core1", 3, 1, "Index List"),
+            ("master", 3, 1, "(Internal)"),
+            ("master", 8, 5, "Core 1 Control stream"),
+            ("core1", 8, 2, "Primitive blocks"),
+            ("core1", 10, 6, "PDS (Vertex Data, Uniform Fetch)"),
+            ("core1", 10, 12, "USSE Data Fence"),
+            ("core1", 13, 1, "Code Fetch"),
+            ("core1", 1, 31, None),
+            ("core1", 5, 1, None),
+        ):
+            with self.subTest(scope=scope, bit=bit, subunit=subunit):
+                fault = _fault_source(scope, 0x10000 | (1 << bit), 0x70001000 | (subunit << 4) | 1)
+                self.assertEqual(fault["requestor_details"][0]["subunit_id"], subunit)
+                self.assertEqual(fault["requestor_details"][0]["subunit_name"], name)
+
     def test_parses_v5_tables_and_trailer(self):
         info = GpuInfo.parse(fixture())
         self.assertEqual(info.core_count, 4)

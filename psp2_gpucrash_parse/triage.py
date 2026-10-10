@@ -61,6 +61,7 @@ def _entry(path: Path, database: RegisterDatabase) -> dict:
             "page": item["gpu_virtual_address"],
             "requestors": sorted(item["requestor_names"]),
             "conditions": sorted(item["fault_conditions"]),
+            "page_access_type": item["page_access_type"],
             "context_id": item["context_id"],
             "scopes": sorted(item["scopes"]),
         }
@@ -193,7 +194,7 @@ def triage_dumps(paths: Sequence[Path], database: RegisterDatabase) -> dict:
             "active_unit": _facet(entries, "active_units", plural=True),
         },
         "signature_notes": {
-            "failure": "Classification, exact fault pages, requestors, conditions, contexts, scopes, lockup phases, and event codes.",
+            "failure": "Classification, exact fault pages, requestors, conditions, page-access types, contexts, scopes, lockup phases, and event codes.",
             "failure_pattern": "Failure signature with fault pages omitted for address-independent grouping.",
             "pipeline": "Decoded firmware master/core phase, unit, draw, and tile state.",
             "register": "GPU register and indexed tables; capture timestamp and context-owner trailer are excluded.",

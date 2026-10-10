@@ -7,8 +7,8 @@ from pathlib import Path
 
 from psp2_gpucrash_parse.cli import _print_diagnosis
 from psp2_gpucrash_parse.core import CoreDump, Note
-from psp2_gpucrash_parse.diagnosis import build_diagnosis
-from psp2_gpucrash_parse.gpu import GpuInfo
+from psp2_gpucrash_parse.diagnosis import _fault_groups, build_diagnosis
+from psp2_gpucrash_parse.gpu import GpuInfo, _fault_source
 from psp2_gpucrash_parse.registers import RegisterDatabase
 
 
@@ -108,6 +108,24 @@ def core_fixture(log=b"", memory_block=None):
 
 
 class DiagnosisTests(unittest.TestCase):
+    def test_fault_groups_keep_entry_directory_distinct_and_preserve_subunits(self):
+        def evidence(scope, status, subunit):
+            fault = _fault_source(scope, status, 0x70001001 | (subunit << 4))
+            return {**fault, "context_attribution": {"owner": None},
+                    "gpu_virtual_address": fault["address"], "null_address": False,
+                    "page_directory_base": 0x41000000}
+
+        groups = _fault_groups([
+            evidence("core0", 0x10002, 0), evidence("core1", 0x50002, 0),
+            evidence("core2", 0x10002, 2),
+        ])
+        self.assertEqual(len(groups), 2)
+        self.assertEqual(groups[0]["scopes"], ["core0", "core2"])
+        self.assertEqual(groups[0]["page_access_type"], "Entry access")
+        self.assertEqual(groups[1]["page_access_type"], "Directory access")
+        self.assertEqual([item["subunit_name"] for item in groups[0]["requestor_details"]],
+                         ["Dependent Texture", "Non-Dependent Texture"])
+
     def test_attributes_bif_fault_to_context_owner(self):
         core = core_fixture(b"GPU watchdog timeout\nlast submission\n")
         info = GpuInfo.parse(gpu_fixture(fault=True))

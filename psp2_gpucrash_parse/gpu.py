@@ -67,14 +67,43 @@ _BIF_REQUESTOR_DETAILS = (
     ("pds-program", "PDS program", "PDS program fetch."),
 )
 
-# SceGpuCoredump likewise treats BIF_INT_STAT.FAULT_TYPE as three independent
-# condition bits.  Combined values (notably 5 in the supplied dumps) therefore
-# have more than one description.
+# The ES4 formatter indexes the low two bits of the three-bit hardware field.
+# Its high bit selects directory/entry access, rather than a second condition.
 _BIF_FAULT_CONDITIONS = (
     "Page not mapped",
     "Read/write access error",
     "System page access",
 )
+
+
+def _requestor_subunit(bit: int, subunit: int, master: bool) -> Optional[str]:
+    if bit == 1 and subunit < 16:
+        dependent = "Non-Dependent" if subunit & 2 else "Dependent"
+        return dependent + " Texture" + (" (Palettized)" if subunit & 8 else "")
+    if bit == 3:
+        names = {0: "Control Stream", 1: "(Internal)"} if master else {
+            0: "Control Stream", 1: "Index List", 2: "(Internal)", 3: "(Internal)"
+        }
+        return names.get(subunit)
+    if bit == 8:
+        if master and subunit in (0, 1, 4, 5, 8, 9, 12, 13):
+            return f"Core {subunit // 4} " + (
+                "Control stream" if subunit & 1 else "Region headers"
+            )
+        if not master:
+            return {0: "Region headers", 1: "Control stream", 2: "Primitive blocks"}.get(subunit)
+    if bit == 10:
+        return {
+            0: "USSE", 1: "USES", 2: "PDS (Vertex Data, Uniform Fetch)",
+            3: "PDS (Vertex Data, Uniform Fetch)", 4: "USSE", 5: "USSE",
+            6: "PDS (Vertex Data, Uniform Fetch)", 7: "PDS (Vertex Data, Uniform Fetch)",
+            8: "USSE Data Fence", 9: "USSE Data Fence", 12: "USSE Data Fence",
+            13: "USSE Data Fence", 14: "Palette Texture Color lookup",
+            15: "Palette Texture Color lookup",
+        }.get(subunit)
+    if bit == 13:
+        return {0: "(Internal)", 1: "Code Fetch", 2: "Data Fetch", 7: "(Internal)"}.get(subunit)
+    return None
 
 
 def _c_string(data: bytes) -> str:
@@ -189,8 +218,9 @@ class GpuTrailer:
             "producer_padding_nonzero_bytes": sum(byte != 0 for byte in self.remainder),
             "producer_padding_sha256": hashlib.sha256(self.remainder).hexdigest(),
             "producer_padding_semantics": (
-                "Outside the producer-initialized extent; retained as raw buffer "
-                "padding and excluded from GPU-state interpretation."
+                "Opaque export tail outside the producer-initialized snapshot. "
+                "It can include adjacent live driver state; excluded from captured "
+                "GPU-state interpretation."
             ),
             # Compatibility names retained for JSON consumers predating the
             # producer-size reconstruction.
@@ -438,7 +468,9 @@ class GpuInfo:
 
 def _fault_source(scope: str, status: int, fault: int) -> dict:
     requestor = status & 0x3FFF
-    fault_type = (status >> 16) & 0x7
+    raw_type = (status >> 16) & 0x7
+    fault_type = raw_type & 3
+    subunit = (fault >> 4) & 0x1F
     requestor_details = [
         {
             "bit": bit,
@@ -446,6 +478,8 @@ def _fault_source(scope: str, status: int, fault: int) -> dict:
             "name": _BIF_REQUESTORS[bit],
             "resource_class": _BIF_REQUESTOR_DETAILS[bit][1],
             "interpretation": _BIF_REQUESTOR_DETAILS[bit][2],
+            "subunit_id": subunit,
+            "subunit_name": _requestor_subunit(bit, subunit, scope == "master"),
         }
         for bit in range(len(_BIF_REQUESTORS))
         if requestor & (1 << bit)
@@ -454,19 +488,17 @@ def _fault_source(scope: str, status: int, fault: int) -> dict:
         "scope": scope,
         "status": status,
         "fault": fault,
-        "status_latched": bool(status & 0x00073FFF),
+        "status_latched": fault_type != 0,
         "fault_register_nonzero": bool(fault),
         "requestor": requestor,
         "requestor_names": [item["name"] for item in requestor_details],
         "requestor_details": requestor_details,
         "fault_type": fault_type,
-        "fault_conditions": [
-            name
-            for bit, name in enumerate(_BIF_FAULT_CONDITIONS)
-            if fault_type & (1 << bit)
-        ],
+        "fault_type_raw": raw_type,
+        "fault_conditions": [_BIF_FAULT_CONDITIONS[fault_type - 1]] if fault_type else [],
+        "page_access_type": "Directory access" if raw_type & 4 else "Entry access",
         "context_id": fault & 0xF,
-        "sideband": (fault >> 4) & 0x1F,
+        "sideband": subunit,
         "address": fault & 0xFFFFF000,
     }
 

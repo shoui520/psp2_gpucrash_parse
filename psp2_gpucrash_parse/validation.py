@@ -35,13 +35,16 @@ _REQUIRED_FIXED_NOTES = {
     "STACK_INFO",
     "SUMMARY_INFO",
     "SYSTEM_INFO",
-    "SYSTEM_INFO2",
     "SYS_DEVICE_INFO",
     "THREAD_INFO",
     "THREAD_REG_INFO",
     "TTY_INFO",
-    "TTY_INFO2",
 }
+
+# Present in the retail reference corpus, absent from a complete devkit
+# GPUCRASH carrying SYSTEM_INFO and TTY_INFO. A profile difference is not a
+# structural failure; SUMMARY_INFO still checks omitted/truncated writes.
+_RETAIL_PROFILE_NOTES = {"SYSTEM_INFO2", "TTY_INFO2"}
 
 
 def validate_core(core: CoreDump) -> dict:
@@ -69,9 +72,18 @@ def validate_core(core: CoreDump) -> dict:
     check(
         "fixed-note-set",
         not missing,
-        "All notes emitted by the fixed Vita GPUCRASH producer are present.",
+        "The common Vita GPUCRASH note set is present.",
         missing=missing,
         required_count=len(_REQUIRED_FIXED_NOTES),
+    )
+    missing_profile = sorted(_RETAIL_PROFILE_NOTES - set(names))
+    check(
+        "retail-note-profile",
+        not missing_profile,
+        "The additional retail-reference SYSTEM_INFO2 and TTY_INFO2 notes are present; "
+        "their absence alone does not establish an incomplete capture.",
+        severity="warning",
+        missing=missing_profile,
     )
     duplicates = {name: count for name, count in names.items() if count != 1}
     check(

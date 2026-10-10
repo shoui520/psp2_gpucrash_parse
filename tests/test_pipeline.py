@@ -5,6 +5,31 @@ from psp2_gpucrash_parse.pipeline import firmware_pipeline_diagnosis
 
 
 class FirmwarePipelineTests(unittest.TestCase):
+    def test_usse_data_master_slots_are_lsb_first_and_not_instruction_state(self):
+        info = GpuInfo(5, (5,) * 15, 1, [], [
+            PerCoreRegister(0xAA4, (0xAAAAAAE4,)),
+            PerCoreRegister(0xAA8, (0x55555555,)),
+            PerCoreRegister(0xB80, (0xAAAAAAAA,)),
+            PerCoreRegister(0xB84, (0xFFFFFFFF,)),
+        ], [], b"")
+        pipes = firmware_pipeline_diagnosis(info)["cores"][0]["usse_data_master_usage"]
+        self.assertEqual(pipes[0]["usage"], "VP.S............")
+        self.assertEqual(pipes[0]["counts"], {"vertex": 1, "fragment": 1, "idle": 13, "service": 1})
+        self.assertEqual(pipes[1]["usage"], "P" * 16)
+        self.assertEqual(pipes[2]["usage"], "." * 16)
+        self.assertEqual(pipes[3]["usage"], "S" * 16)
+
+    def test_draw_number_zero_and_one_both_display_zero_only_for_ta(self):
+        info = GpuInfo(5, (5,) * 15, 1, [], [], [
+            PerCoreRegister(0x26, (0,)), PerCoreRegister(0x12, (0x10000,)),
+            PerCoreRegister(0x2E, (0x10000,)),
+        ], b"")
+        counters = firmware_pipeline_diagnosis(info)["cores"][0]["draw_counters"]
+        self.assertEqual([item["draw_number"] for item in counters], [0, 0, 1])
+        self.assertEqual([item["counter_value"] for item in counters], [0, 1, 1])
+        checks = firmware_pipeline_diagnosis(info)["cores"][0]["draw_counter_checks"]
+        self.assertFalse(checks[0]["aligned"])
+
     def test_decodes_firmware_phase_units_counters_tiles_and_surfaces(self):
         inactive = 0xFFFFFFFF
         unit_value = inactive & ~(0x01000000 | 0x04000000 | 0x10000000)
@@ -55,12 +80,12 @@ class FirmwarePipelineTests(unittest.TestCase):
             ["pds", "mte", "isp"],
         )
         counters = {item["code"]: item["draw_number"] for item in core["draw_counters"]}
-        self.assertEqual(counters["mte"], 0xABC)
-        self.assertEqual(counters["vdm-pipe-0"], 0x1234)
+        self.assertEqual(counters["mte"], 0xABB)
+        self.assertEqual(counters["vdm-pipe-0"], 0x1233)
         self.assertEqual(counters["isp-output"], 0x45)
         tiles = {item["code"]: item for item in core["tile_progress"]}
-        self.assertEqual((tiles["pds"]["tile_x"], tiles["pds"]["tile_y"]), (10, 20))
-        self.assertEqual((tiles["isp-output"]["tile_x"], tiles["isp-output"]["tile_y"]), (6, 2))
+        self.assertEqual((tiles["pds"]["tile_x"], tiles["pds"]["tile_y"]), (20, 10))
+        self.assertEqual((tiles["isp-output"]["tile_x"], tiles["isp-output"]["tile_y"]), (2, 6))
         self.assertEqual(core["render_bounds"]["width_pixels"], 640)
         self.assertEqual(core["render_bounds"]["height_pixels"], 224)
         self.assertEqual(core["region_header_base"], 0x50042000)

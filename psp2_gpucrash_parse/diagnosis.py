@@ -340,6 +340,7 @@ def _fault_groups(faults: Sequence[dict]) -> List[dict]:
             fault["gpu_virtual_address"],
             fault["requestor"],
             fault["fault_type"],
+            fault["page_access_type"],
             fault["context_id"],
             fault["page_directory_base"],
             owner_process_id,
@@ -355,6 +356,8 @@ def _fault_groups(faults: Sequence[dict]) -> List[dict]:
                 "requestor_names": list(fault["requestor_names"]),
                 "requestor_details": list(fault["requestor_details"]),
                 "fault_type": fault["fault_type"],
+                "fault_type_raw": fault["fault_type_raw"],
+                "page_access_type": fault["page_access_type"],
                 "fault_conditions": list(fault["fault_conditions"]),
                 "context_id": fault["context_id"],
                 "context_attribution": fault["context_attribution"],
@@ -367,6 +370,9 @@ def _fault_groups(faults: Sequence[dict]) -> List[dict]:
             }
             grouped[key] = group
         group["source_indices"].append(index)
+        for detail in fault["requestor_details"]:
+            if detail not in group["requestor_details"]:
+                group["requestor_details"].append(detail)
         if fault["scope"] not in group["scopes"]:
             group["scopes"].append(fault["scope"])
         if fault["sideband"] not in group["sidebands"]:
@@ -784,9 +790,9 @@ def _verdict(
             return (
                 "gpu-bif-fault-register-residue",
                 "medium",
-                f"BIF fault-register state retained on {scopes}; interrupt fault status clear",
-                "BIF_FAULT is nonzero while BIF_INT_STAT.FAULT_REQ and FAULT_TYPE are "
-                "clear. Treat the address as residual state, not a confirmed active fault.",
+                f"BIF fault-register state retained on {scopes}; fault-type status clear",
+                "BIF requestor/address fields are retained, but the BIF_INT_STAT fault "
+                "condition is zero. Treat the address as residual state, not a confirmed active fault.",
             )
         active_groups = [group for group in fault_groups if group["status_latched"]]
         null_groups = [group for group in active_groups if group["null_address"]]
@@ -913,7 +919,7 @@ def _failure_identity(
                 (
                     fault["scope"].upper(),
                     f"REQ_{fault['requestor']:04X}",
-                    f"TYPE_{fault['fault_type']}",
+                    f"TYPE_{fault['fault_type_raw']}",
                     f"CID_{fault['context_id']}",
                 )
             )

@@ -30,9 +30,9 @@ _DRAW_SELECTORS = (
     (0x31, "tsp-parameter-fetch", "TSP parameter fetch", 0x1FFF0000, 16),
 )
 
-# The firmware uses two coordinate formatters.  USSE/PDS selectors store X in
-# bits 15:8 and Y in bits 7:0; the remaining selectors store X in bits 7:0 and
-# Y in bits 15:8.  A tile is 16 by 16 pixels.
+# The firmware uses two coordinate formatters. USSE/PDS selectors use the
+# swapped formatter: X in bits 7:0, Y in bits 15:8. The ordinary formatter
+# uses X in bits 15:8, Y in bits 7:0. A tile is 16 by 16 pixels.
 _TILE_SELECTORS = (
     (0x51, "usse-pipe-0", "USSE pipe 0", True),
     (0x52, "usse-pipe-1", "USSE pipe 1", True),
@@ -84,11 +84,11 @@ def _core_value(info: GpuInfo, offset: int, core_index: int) -> Optional[int]:
 def _tile(selector: int, code: str, name: str, value: int, swapped: bool) -> dict:
     packed = value & 0xFFFF
     if swapped:
-        x = (packed >> 8) & 0xFF
-        y = packed & 0xFF
-    else:
         x = packed & 0xFF
         y = (packed >> 8) & 0xFF
+    else:
+        x = (packed >> 8) & 0xFF
+        y = packed & 0xFF
     return {
         "code": code,
         "name": name,
@@ -148,6 +148,26 @@ def _zls_state(info: GpuInfo, core_index: int) -> Optional[dict]:
     }
 
 
+def _usse_data_master_usage(info: GpuInfo, core_index: int) -> List[dict]:
+    # GpuCoreDumpPrintUssePipe reads sixteen two-bit slots, least significant
+    # first. These are data-master tags, not PCs or instruction opcodes.
+    names = ("vertex", "fragment", "idle", "service")
+    symbols = "VP.S"
+    pipes = []
+    for pipe, offset in enumerate((0x0AA4, 0x0AA8, 0x0B80, 0x0B84)):
+        value = _core_value(info, offset, core_index)
+        if value is None:
+            continue
+        slots = [(value >> (index * 2)) & 3 for index in range(16)]
+        pipes.append({
+            "pipe": pipe, "register_offset": offset, "raw_value": value,
+            "usage": "".join(symbols[slot] for slot in slots),
+            "slots": [names[slot] for slot in slots],
+            "counts": {name: slots.count(index) for index, name in enumerate(names)},
+        })
+    return pipes
+
+
 def _core_pipeline(
     info: GpuInfo, table: Dict[int, Tuple[int, ...]], core_index: int
 ) -> dict:
@@ -172,19 +192,25 @@ def _core_pipeline(
     for selector, code, name, mask, shift in _DRAW_SELECTORS:
         value = _indexed_value(table, selector, core_index)
         if value is not None:
+            counter = (value & mask) >> shift
+            # MTE/VDM use PrintDrawNumber (zero or count - 1); ISP/TSP use
+            # PrintUnsigned directly. Preserve both the field and display.
+            biased = code == "mte" or code.startswith("vdm-pipe-")
             draw_counters.append(
                 {
                     "code": code,
                     "name": name,
                     "selector": selector,
                     "raw_value": value,
-                    "draw_number": (value & mask) >> shift,
+                    "counter_value": counter,
+                    "draw_number": max(0, counter - 1) if biased else counter,
+                    "encoding": "zero-or-draw-plus-one" if biased else "draw-number",
                     "counter_mask": mask >> shift,
                 }
             )
 
     counter_by_code = {
-        item["code"]: item["draw_number"] for item in draw_counters
+        item["code"]: item["counter_value"] for item in draw_counters
     }
     counter_checks = []
     for code, name, members in (
@@ -210,6 +236,7 @@ def _core_pipeline(
                     "code": code,
                     "name": name,
                     "values": values,
+                    "basis": "raw counter fields",
                     "aligned": len(set(values.values())) == 1,
                 }
             )
@@ -269,6 +296,7 @@ def _core_pipeline(
         "unit_selector": 0x02,
         "unit_value": unit_value,
         "active_units": active_units,
+        "usse_data_master_usage": _usse_data_master_usage(info, core_index),
         "draw_counters": draw_counters,
         "draw_counter_checks": counter_checks,
         "tile_progress": tiles,
@@ -314,7 +342,9 @@ def firmware_pipeline_diagnosis(info: GpuInfo) -> dict:
         "cores": cores,
         "notes": [
             "Draw numbers are retained 13-bit hardware counters and may wrap.",
+            "MTE/VDM draw numbers use the firmware's zero-or-counter-minus-one formatter; raw counter fields are retained.",
             "Tile coordinates are hardware progress positions; each tile is 16x16 pixels.",
+            "USSE slots are data-master tags, not shader instructions or instruction addresses.",
             "Active-unit bits are low-active in indexed selector 2.",
         ],
     }

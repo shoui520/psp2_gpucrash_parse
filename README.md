@@ -20,6 +20,14 @@ Write the complete analysis as JSON:
 ./psp2-gpucrash-parse analyze dump.psp2dmp --json
 ```
 
+GPUCRASH analysis does not require a devkit sidecar. If one is available:
+
+```sh
+./psp2-gpucrash-parse analyze dump.psp2dmp --gpu-dump gpu-dump.bin
+./psp2-gpucrash-parse gpu-dump gpu-dump.bin --core-dump dump.psp2dmp
+./psp2-gpucrash-parse gpu-dump gpu-dump.bin --text
+```
+
 Other basic commands:
 
 ```sh
