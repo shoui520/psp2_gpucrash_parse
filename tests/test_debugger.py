@@ -1,5 +1,6 @@
 import struct
 import unittest
+from dataclasses import replace
 from pathlib import Path
 
 from psp2_gpucrash_parse.core import CoreDump, LoadSegment, Note
@@ -12,6 +13,8 @@ from psp2_gpucrash_parse.debugger import (
     thread_list_report,
 )
 from psp2_gpucrash_parse.registers import RegisterDatabase
+from psp2_gpucrash_parse.diagnosis import build_diagnosis
+from psp2_gpucrash_parse.gpu import GpuInfo
 from tests.test_diagnosis import core_fixture, gpu_fixture
 
 
@@ -87,6 +90,23 @@ def dormant_execution_core():
 
 
 class DebuggerTests(unittest.TestCase):
+    def test_compare_exposes_frame_scene_and_scope_changes_when_aggregate_is_unchanged(self):
+        info = GpuInfo.parse(gpu_fixture())
+        left = build_diagnosis(core_fixture(), info, RegisterDatabase())
+        trailer = bytearray(info.trailer)
+        struct.pack_into("<4I", trailer, 0xE8, 50, 49, 3, 2)
+        trailer[0xC0 + 1] = 0xFF
+        right = build_diagnosis(core_fixture(), replace(info, trailer=bytes(trailer)), RegisterDatabase())
+        comparison = compare_debug_state(left, right)
+        self.assertTrue(comparison["pipeline"]["render_state_changed"])
+        self.assertEqual(comparison["pipeline"]["right_render_state"]["fragment_frame"], 49)
+        self.assertFalse(comparison["pipeline"]["clipper_halt_check_changed"])
+        scoped = comparison["context_scope_assignment_changes"]
+        self.assertEqual([(item["scope"], item["context_id"]) for item in scoped["removed"]], [("core0", 1)])
+        same = compare_debug_state(right, right)
+        self.assertFalse(same["pipeline"]["render_state_changed"])
+        self.assertEqual(same["context_scope_assignment_changes"], {"added": [], "removed": [], "changed": []})
+
     def test_fault_address_reports_metadata_without_claiming_bytes(self):
         report = address_report(
             debug_core(fault=True), RegisterDatabase(), 0x3E060000

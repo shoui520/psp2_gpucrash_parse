@@ -530,6 +530,8 @@ def _pipeline_core_summary(item: dict) -> dict:
             "external_depth_buffer": zls["external_depth_buffer"],
             "extent_field": zls["extent_field"],
             "width_pixels": zls["width_pixels"],
+            "width_samples": zls["width_samples"],
+            "msaa": zls["msaa"],
             "depth_load_format": zls["depth_load_format"],
             "depth_store_format": zls["depth_store_format"],
             "surfaces": {
@@ -552,10 +554,14 @@ def _pipeline_core_summary(item: dict) -> dict:
             counter["code"]: counter["draw_number"]
             for counter in item["draw_counters"]
         },
+        "draw_counter_applicability": {
+            counter["code"]: counter["applicability"] for counter in item["draw_counters"]
+        },
         "tile_progress": {
             tile["code"]: [tile["tile_x"], tile["tile_y"]]
             for tile in item["tile_progress"]
         },
+        "tile_applicability": {tile["code"]: tile["applicability"] for tile in item["tile_progress"]},
         "render_bounds": item["render_bounds"],
         "isp_progress": item["isp_progress"],
         "region_header_base": item["region_header_base"],
@@ -684,7 +690,16 @@ def compare_debug_state(left: dict, right: dict) -> dict:
         },
         "fault_groups": faults,
         "context_assignment_changes": context_changes,
+        "context_scope_assignment_changes": _keyed_changes(
+            left["context_scope_assignments"], right["context_scope_assignments"], ("scope", "context_id")
+        ),
         "pipeline": {
+            "left_render_state": left_pipeline["render_state"],
+            "right_render_state": right_pipeline["render_state"],
+            "render_state_changed": left_pipeline["render_state"] != right_pipeline["render_state"],
+            "left_clipper_halt_check": left_pipeline["clipper_halt_check"],
+            "right_clipper_halt_check": right_pipeline["clipper_halt_check"],
+            "clipper_halt_check_changed": left_pipeline["clipper_halt_check"] != right_pipeline["clipper_halt_check"],
             "left_master": left_pipeline["master"],
             "right_master": right_pipeline["master"],
             "master_changed": left_pipeline["master"] != right_pipeline["master"],

@@ -93,7 +93,9 @@ def matching_info(native):
     trailer[0xC0:0xE8] = b"\xff" * 40
     for row in range(5):
         trailer[0xC0 + row * 8 + 1] = 1
-    return replace(info, trailer=bytes(trailer))
+    header = list(info.header_words)
+    header[2] |= 8  # The synthetic note now includes a captured owner table.
+    return replace(info, trailer=bytes(trailer), header_words=tuple(header))
 
 
 class DesTests(unittest.TestCase):
@@ -144,6 +146,8 @@ class DevkitTests(unittest.TestCase):
         self.assertEqual(fault["page_access_type"], "Entry access")
         pipe = report["firmware_pipeline"]["cores"][1]["usse_data_master_usage"][1]
         self.assertEqual(pipe["usage"], "PPPPPPPP........")
+        self.assertTrue(report["firmware_pipeline"]["render_state"]["available"])
+        self.assertEqual(report["firmware_pipeline"]["render_state"]["vertex_frame"], 10)
         self.assertEqual(report["native_diagnostics"]["partial_renders_since_boot"], 12)
         self.assertEqual(report["native_diagnostics"]["fault_processes"][0]["process_id"], 0x456)
         self.assertEqual(bytes.fromhex(report["analysis_text_raw_hex"]), self.native.text_bytes)
@@ -177,6 +181,21 @@ class DevkitTests(unittest.TestCase):
         self.assertEqual(len(report["matching_processes"]), 2)
         self.assertEqual(report["status"], "mismatch")
         self.assertEqual(report["fault_process_checks"][0]["status"], "mismatch")
+
+    def test_correlation_uses_fault_scope_map_without_cross_core_fallback(self):
+        info = matching_info(self.native)
+        trailer = bytearray(info.trailer)
+        trailer[0xC0 + 1] = 2  # Unrelated core 0 owns CID 1 differently.
+        report = correlate_gpu_dump(self.native, core_fixture(), replace(info, trailer=bytes(trailer)))
+        self.assertEqual(report["status"], "consistent")
+        self.assertEqual(report["fault_process_checks"][0]["context_attribution"]["map_row"], 1)
+        trailer[0xC0 + 8 + 1] = 0xFF  # The faulting core has no assignment.
+        report = correlate_gpu_dump(self.native, core_fixture(), replace(info, trailer=bytes(trailer)))
+        self.assertEqual(report["status"], "inconclusive")
+        self.assertEqual(report["fault_process_checks"][0]["status"], "unresolved")
+        trailer[0xC0 + 8 + 1] = 2
+        report = correlate_gpu_dump(self.native, core_fixture(), replace(info, trailer=bytes(trailer)))
+        self.assertEqual(report["status"], "mismatch")
 
     def test_absent_owner_evidence_is_inconclusive(self):
         report = correlate_gpu_dump(self.native, core_fixture(), self.native.register_state())

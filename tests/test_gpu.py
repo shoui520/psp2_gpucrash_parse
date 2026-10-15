@@ -1,5 +1,6 @@
 import struct
 import unittest
+from dataclasses import replace
 
 from psp2_gpucrash_parse.gpu import GpuInfo, GpuTrailer, _fault_source, compare_gpu_info
 from psp2_gpucrash_parse.registers import RegisterDatabase
@@ -22,6 +23,51 @@ def fixture(
 
 
 class GpuInfoTests(unittest.TestCase):
+    def test_render_state_names_words_and_requires_capture_flag_and_complete_trailer(self):
+        trailer = bytearray(0xF8)
+        struct.pack_into("<4I", trailer, 0xE8, 700, 699, 3, 3)
+        info = GpuInfo.parse(fixture()[:-4] + trailer)
+        state = info.render_state()
+        self.assertTrue(state["available"])
+        self.assertEqual((state["vertex_frame"], state["fragment_frame"],
+                          state["vertex_scene"], state["fragment_scene"]), (700, 699, 3, 3))
+        self.assertEqual(info.summary(RegisterDatabase())["render_state"], state)
+        self.assertEqual(info.decoded_trailer().summary()["driver_state"][0]["name"], "vertex_frame")
+        header = list(info.header_words)
+        header[2] &= ~0x10
+        missing_flag = replace(info, header_words=tuple(header)).render_state()
+        self.assertFalse(missing_flag["available"])
+        self.assertIsNone(missing_flag["vertex_frame"])
+        self.assertEqual(missing_flag["raw_words"], [700, 699, 3, 3])
+        self.assertFalse(GpuInfo.parse(fixture()).render_state()["available"])
+        self.assertTrue(replace(info, trailer=bytes(0xF8)).render_state()["available"])
+
+    def test_context_map_resolves_exact_scope_without_other_row_fallback(self):
+        trailer = bytearray(0xF8)
+        for slot in range(8):
+            struct.pack_into("<I", trailer, slot * 24, 0xFFFFFFFF)
+        struct.pack_into("<I", trailer, 0, 0x123)
+        struct.pack_into("<I", trailer, 24, 0x456)
+        trailer[0xC0:0xE8] = b"\xff" * 40
+        for row, slot in ((0, 0), (1, 1), (4, 1)):
+            trailer[0xC0 + row * 8 + 2] = slot
+        info = GpuInfo.parse(fixture()[:-4] + trailer)
+        self.assertEqual(info.context_attribution(2)["status"], "ambiguous")
+        for scope, row, pid in (("core0", 0, 0x123), ("core1", 1, 0x456), ("master", 4, 0x456)):
+            with self.subTest(scope=scope):
+                owner = info.context_attribution(2, scope)
+                self.assertEqual(owner["map_row"], row)
+                self.assertEqual(owner["owner"]["process_id"], pid)
+        self.assertIsNone(info.context_attribution(2, "core2")["owner"])
+        self.assertEqual(info.context_attribution(2, "core2")["status"], "unassigned")
+        for cid, scope in ((8, "core0"), (-1, "master"), (2, "core4")):
+            self.assertEqual(info.context_attribution(cid, scope)["status"], "out-of-range")
+        trailer[0xC0 + 2] = 9
+        self.assertEqual(replace(info, trailer=bytes(trailer)).context_attribution(2, "core0")["status"], "invalid-slot")
+        header = list(info.header_words)
+        header[2] &= ~8
+        self.assertIsNone(replace(info, header_words=tuple(header)).context_attribution(2, "core0")["owner"])
+
     def test_bif_condition_is_an_enum_with_separate_directory_access_bit(self):
         for raw, condition, access in (
             (1, "Page not mapped", "Entry access"),

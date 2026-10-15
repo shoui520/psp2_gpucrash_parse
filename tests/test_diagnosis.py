@@ -1,15 +1,19 @@
 import argparse
 import io
+import json
 import struct
 import unittest
 from contextlib import redirect_stdout
+from dataclasses import replace
 from pathlib import Path
+from unittest.mock import patch
 
-from psp2_gpucrash_parse.cli import _print_diagnosis
+from psp2_gpucrash_parse.cli import _print_diagnosis, _print_firmware_pipeline_diagnostics, main
 from psp2_gpucrash_parse.core import CoreDump, Note
 from psp2_gpucrash_parse.diagnosis import _fault_groups, build_diagnosis
-from psp2_gpucrash_parse.gpu import GpuInfo, _fault_source
+from psp2_gpucrash_parse.gpu import GpuInfo, PerCoreRegister, _fault_source
 from psp2_gpucrash_parse.registers import RegisterDatabase
+from tests.test_pipeline import clipper_fixture
 
 
 def gpu_fixture(
@@ -108,6 +112,135 @@ def core_fixture(log=b"", memory_block=None):
 
 
 class DiagnosisTests(unittest.TestCase):
+    def test_gpu_views_expose_scoped_contexts_and_frame_state_in_compact_json_and_text(self):
+        info = GpuInfo.parse(gpu_fixture())
+        trailer = bytearray(info.trailer)
+        struct.pack_into("<4I", trailer, 0xE8, 50, 49, 3, 2)
+        info = replace(info, trailer=bytes(trailer))
+        diagnosis = build_diagnosis(core_fixture(), info, RegisterDatabase())
+        for view in ("contexts", "pipeline"):
+            for json_output in (False, True):
+                output = io.StringIO()
+                with patch("psp2_gpucrash_parse.cli.CoreDump.read", return_value=core_fixture()), \
+                     patch("psp2_gpucrash_parse.cli.load_debug_state", return_value=(info, diagnosis)), \
+                     redirect_stdout(output):
+                    self.assertEqual(main(["gpu", view, "core.psp2dmp", *(["--json"] if json_output else [])]), 0)
+                if json_output:
+                    report = json.loads(output.getvalue())
+                    if view == "contexts":
+                        self.assertEqual(report["context_slot_map_scopes"], ["core0", "core1", "core2", "core3", "master"])
+                        self.assertEqual(len(report["context_scope_assignments"]), 5)
+                    else:
+                        self.assertEqual(report["firmware_pipeline"]["render_state"]["fragment_frame"], 49)
+                        self.assertIn("clipper_halt_check", report["firmware_pipeline"])
+                elif view == "contexts":
+                    self.assertIn("core2  CID 1 -> slot 1", output.getvalue())
+                    self.assertNotIn("remain unnamed", output.getvalue())
+                else:
+                    self.assertIn("frame=50 scene=3", output.getvalue())
+                    self.assertIn("frame=49 scene=2", output.getvalue())
+
+    def test_text_keeps_inactive_counter_values_without_false_divergence_and_labels_msaa_units(self):
+        info = GpuInfo.parse(gpu_fixture())
+        info = replace(info, per_core_registers=[
+            *info.per_core_registers, PerCoreRegister(0xAA4, (0xAAAAAAAA,) * 4),
+            PerCoreRegister(0x480, (0x100000 | (19 << 3),) * 4),
+            PerCoreRegister(0x42C, (2,) * 4),
+        ], indexed_state=[PerCoreRegister(0, (2,) * 4), PerCoreRegister(2, (0xFFFFFFFF,) * 4),
+                          PerCoreRegister(0x26, (99,) * 4), PerCoreRegister(0x12, (3 << 16,) * 4)])
+        diagnosis = build_diagnosis(core_fixture(), info, RegisterDatabase())
+        output = io.StringIO()
+        with redirect_stdout(output):
+            _print_firmware_pipeline_diagnostics(diagnosis)
+        text = output.getvalue()
+        self.assertIn("MTE=98(counter=99) [inactive]", text)
+        self.assertIn("TA MTE/VDM draw counters: not-comparable", text)
+        self.assertNotIn("diverged", text)
+        self.assertIn("width=320px samples=640 msaa=4x", text)
+
+    def test_compare_summary_and_details_include_frame_scene_changes(self):
+        left, right = core_fixture(), core_fixture()
+        left.path, right.path = Path("left.psp2dmp"), Path("right.psp2dmp")
+        left.notes.append(Note("GPU_INFO", 0x2000, gpu_fixture(), 0))
+        data = bytearray(gpu_fixture())
+        struct.pack_into("<4I", data, len(data) - 0xF8 + 0xE8, 50, 49, 3, 2)
+        right.notes.append(Note("GPU_INFO", 0x2000, bytes(data), 0))
+        cores = {left.path: left, right.path: right}
+        for options in (["--json", "--summary-only"], ["--json"], []):
+            output = io.StringIO()
+            with patch("psp2_gpucrash_parse.cli.CoreDump.read", side_effect=lambda path: cores[Path(path)]), redirect_stdout(output):
+                self.assertEqual(main(["compare", str(left.path), str(right.path), *options]), 0)
+            if "--json" in options:
+                report = json.loads(output.getvalue())
+                self.assertTrue(report["postmortem"]["pipeline"]["render_state_changed"])
+                if "--summary-only" not in options:
+                    self.assertEqual(report["postmortem"]["pipeline"]["right_render_state"]["vertex_frame"], 50)
+                    self.assertIn("context_scope_assignment_changes", report["postmortem"])
+            else:
+                self.assertIn("vertex_frame: 0 -> 50", output.getvalue())
+                self.assertIn("frame/scene=true", output.getvalue())
+
+    def test_fault_ownership_uses_source_row_even_when_other_cores_disagree(self):
+        info = GpuInfo.parse(gpu_fixture(fault=True, fault_cores=(0, 2)))
+        trailer = bytearray(info.trailer)
+        struct.pack_into("<I", trailer, 2 * 24, 0x234567)
+        trailer[2 * 24 + 4:2 * 24 + 4 + 12] = b"OtherProcess"
+        trailer[0xC0 + 1] = 2
+        info = replace(info, trailer=bytes(trailer))
+        diagnosis = build_diagnosis(core_fixture(), info, RegisterDatabase())
+        self.assertEqual([item["context_attribution"]["owner"]["process_name"]
+                          for item in diagnosis["fault_sources"]], ["OtherProcess", "SampleProcess"])
+        self.assertEqual(len(diagnosis["fault_groups"]), 2)
+        self.assertEqual([item["context_attribution"]["map_row"] for item in diagnosis["fault_sources"]], [0, 2])
+        self.assertEqual(diagnosis["context_assignments"], [])  # Aggregate is ambiguous.
+        self.assertEqual(len(diagnosis["context_scope_assignments"]), 5)
+
+    def test_unassigned_fault_scope_does_not_borrow_another_scope_owner(self):
+        info = GpuInfo.parse(gpu_fixture(fault=True))
+        trailer = bytearray(info.trailer)
+        trailer[0xC0 + 2 * 8 + 1] = 0xFF
+        diagnosis = build_diagnosis(core_fixture(), replace(info, trailer=bytes(trailer)), RegisterDatabase())
+        self.assertIsNone(diagnosis["fault_sources"][0]["context_attribution"]["owner"])
+        self.assertEqual(diagnosis["fault_sources"][0]["context_attribution"]["status"], "unassigned")
+
+    def test_master_fault_ownership_uses_last_map_row(self):
+        info = GpuInfo.parse(gpu_fixture())
+        trailer = bytearray(info.trailer)
+        trailer[0xC0 + 4 * 8 + 1] = 0xFF
+        rows = [replace(row, value=0x10002 if row.offset == 0x4C04 else 0x70001001)
+                if row.offset in (0x4C04, 0x4C08) else row for row in info.master_registers]
+        diagnosis = build_diagnosis(core_fixture(), replace(info, trailer=bytes(trailer), master_registers=rows), RegisterDatabase())
+        fault = diagnosis["fault_sources"][0]
+        self.assertEqual(fault["scope"], "master")
+        self.assertEqual(fault["context_attribution"]["map_row"], 4)
+        self.assertIsNone(fault["context_attribution"]["owner"])
+
+    def test_clipper_signature_reports_candidate_and_scoped_ta_owner_not_proven_defect(self):
+        info = replace(clipper_fixture(), trailer=GpuInfo.parse(gpu_fixture()).trailer)
+        diagnosis = build_diagnosis(core_fixture(), info, RegisterDatabase())
+        self.assertEqual(diagnosis["classification"], "gpu-clipper-halt-signature")
+        self.assertEqual(diagnosis["classification_confidence"], "medium")
+        self.assertEqual(diagnosis["root_cause_confidence"], "low")
+        signature = diagnosis["firmware_signatures"][0]
+        self.assertEqual(signature["context_attribution"]["owner"]["process_name"], "SampleProcess")
+        self.assertEqual(signature["context_attribution"]["map_row"], 2)
+        self.assertIn("not a confirmed hardware defect", diagnosis["explanation"])
+        self.assertEqual(diagnosis["fault_sources"], [])
+        output = io.StringIO()
+        with redirect_stdout(output):
+            _print_diagnosis(core_fixture(), info, RegisterDatabase(), None, diagnosis,
+                             argparse.Namespace(no_log=True, log_lines=0))
+        self.assertIn("Clipper halt signature: matched", output.getvalue())
+        self.assertIn("draw=100 counter=101 ctx=1", output.getvalue())
+        self.assertIn("TA process: SampleProcess", output.getvalue())
+
+    def test_real_bif_fault_takes_precedence_over_clipper_selector_bit(self):
+        info = clipper_fixture()
+        info.per_core_registers[0] = replace(info.per_core_registers[0], values=(0, 0, 0x10002, 0))
+        diagnosis = build_diagnosis(core_fixture(), info, RegisterDatabase())
+        self.assertEqual(diagnosis["classification"], "gpu-bif-access-fault")
+        self.assertEqual(diagnosis["firmware_signatures"], [])
+
     def test_fault_groups_keep_entry_directory_distinct_and_preserve_subunits(self):
         def evidence(scope, status, subunit):
             fault = _fault_source(scope, status, 0x70001001 | (subunit << 4))

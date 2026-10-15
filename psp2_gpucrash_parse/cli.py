@@ -24,7 +24,7 @@ from .debugger import (
 from .diagnosis import build_diagnosis
 from .devkit import DevkitGpuDump, correlate_gpu_dump
 from .elfimage import enrich_address_with_elfs, enrich_diagnosis_with_elfs
-from .gpu import GpuInfo, compare_gpu_info
+from .gpu import GPU_CONTEXT_MAP_SCOPES, GPU_RENDER_STATE_FIELDS, GpuInfo, compare_gpu_info
 from .indexed import indexed_selector_metadata
 from .inspection import (
     annotated_stack,
@@ -994,13 +994,14 @@ def _print_gpu_info(info: GpuInfo, database: RegisterDatabase) -> None:
         "    Padding SHA-256       : "
         f"{trailer_summary['producer_padding_sha256']}"
     )
-    print("    GPU driver object     :")
+    print("    TA/3D control snapshot:")
     for item in trailer_summary["driver_state"]:
         print(
             f"      +0x{item['source_object_offset']:03x}="
-            f"0x{item['value']:08x}"
+            f"0x{item['value']:08x} ({item['name']})"
         )
-    print("      Field semantics are not established.")
+    if not info.render_state()["available"]:
+        print("      Render-state interpretation unavailable: missing capture flag or words.")
     print("\nREGISTER_DEFINITION_SOURCES:")
     print("    Built-in SGX543 diagnostic register set")
     for source in database.sources:
@@ -1200,6 +1201,35 @@ def _print_pipeline_register_state(
             print(f"      core{index}={_hex(value)}{suffix}")
 
 
+def _print_render_state(pipeline: dict) -> None:
+    state = pipeline["render_state"]
+    if not state["available"]:
+        print("    Frame/scene state     : unavailable (capture flag or snapshot words missing)")
+        return
+    for phase in ("vertex", "fragment"):
+        label = f"{phase.capitalize()} frame/scene"
+        print(f"    {label:22}: frame={state[phase + '_frame']} scene={state[phase + '_scene']}")
+    print("    Retained counters; not completion fences. Differences alone do not establish a stall.")
+
+
+def _print_clipper_halt_check(pipeline: dict, cores: Optional[Sequence[int]] = None) -> None:
+    check = pipeline["clipper_halt_check"]
+    print(f"    Clipper halt signature: {check['status']}")
+    for item in check["matches"]:
+        if cores is not None and not _gpu_scope_selected(item["scope"], cores):
+            print(f"        Match on {item['scope']} is outside the selected cores.")
+            continue
+        print(
+            f"        {item['scope']}: selector=0x{item['selector']:02x} "
+            f"value={_hex(item['raw_value'])} mask={_hex(item['mask'])} "
+            f"draw={item['draw_number']} counter={item['draw_counter']} ctx={item['context_id']}"
+        )
+        owner = item.get("context_attribution", {}).get("owner")
+        if owner is not None:
+            print(f"        TA process: {owner['process_name'] or '<unnamed>'} pid={_hex(owner['process_id'])}")
+        print(f"        {item['qualification']}")
+
+
 def _print_firmware_pipeline_diagnostics(
     diagnosis: dict, cores: Optional[Sequence[int]] = None
 ) -> None:
@@ -1207,6 +1237,8 @@ def _print_firmware_pipeline_diagnostics(
     master = pipeline["master"]
     print("\nFIRMWARE_PIPELINE_DIAGNOSTICS:")
     print(f"    Decoder               : {pipeline['decoder']}")
+    _print_render_state(pipeline)
+    _print_clipper_halt_check(pipeline, cores)
     print(
         f"    Phase-active cores    : {pipeline['active_core_count']} "
         f"({','.join(str(item) for item in pipeline['active_cores']) or 'none'})"
@@ -1242,7 +1274,9 @@ def _print_firmware_pipeline_diagnostics(
             )
         if not core["active_phases"]:
             print("        No vertex/fragment activity bit was retained for this core.")
-            continue
+            if not any(pipe["counts"]["vertex"] or pipe["counts"]["fragment"]
+                       for pipe in core["usse_data_master_usage"]):
+                continue
 
         counters = core["draw_counters"]
         if counters:
@@ -1253,18 +1287,22 @@ def _print_firmware_pipeline_diagnostics(
                     + "  ".join(
                         f"{item['name']}={item['draw_number']}"
                         + (f"(counter={item['counter_value']})" if item["encoding"] == "zero-or-draw-plus-one" else "")
+                        + f" [{item['applicability']}]"
                         for item in counters[base : base + 4]
                     )
                 )
-            print("        Counter checks    : raw counter fields")
+            print("        Counter checks    : applicable raw counter fields only")
             for check in core["draw_counter_checks"]:
                 values = ", ".join(
                     f"{name}={value}" for name, value in check["values"].items()
                 )
                 print(
                     f"            {check['name']}: "
-                    f"{'aligned' if check['aligned'] else 'diverged'} ({values})"
+                    f"{check['status']} ({values or 'fewer than two active fields'})"
                 )
+                if check["excluded"]:
+                    print("                Excluded: " + ", ".join(
+                        f"{name}={state}" for name, state in check["excluded"].items()))
 
         tiles = core["tile_progress"]
         if tiles:
@@ -1275,6 +1313,7 @@ def _print_firmware_pipeline_diagnostics(
                     + "  ".join(
                         f"{item['name']}=({item['tile_x']},{item['tile_y']})"
                         f"/{item['pixel_x']},{item['pixel_y']}px"
+                        f" [{item['applicability']}]"
                         for item in tiles[base : base + 3]
                     )
                 )
@@ -1284,8 +1323,11 @@ def _print_firmware_pipeline_diagnostics(
                 )
                 print(
                     f"            {check['name']}: "
-                    f"{'aligned' if check['aligned'] else 'diverged'} ({values})"
+                    f"{check['status']} ({values or 'fewer than two active fields'})"
                 )
+                if check["excluded"]:
+                    print("                Excluded: " + ", ".join(
+                        f"{name}={state}" for name, state in check["excluded"].items()))
 
         progress = core["isp_progress"]
         if progress is not None:
@@ -1317,7 +1359,9 @@ def _print_firmware_pipeline_diagnostics(
             print(
                 "        Depth/stencil     : "
                 f"external={str(zls['external_depth_buffer']).lower()} "
-                f"width={zls['width_pixels'] if zls['width_pixels'] is not None else 'n/a'} "
+                f"width={zls['width_pixels'] if zls['width_pixels'] is not None else 'n/a'}px "
+                f"samples={zls['width_samples'] if zls['width_samples'] is not None else 'n/a'} "
+                f"msaa={zls['msaa']['mode']} "
                 f"flags={','.join(zls['flags']) or 'none'} "
                 f"raw={_hex(zls['control'])}"
             )
@@ -1339,6 +1383,8 @@ def _print_firmware_pipeline_diagnostics(
     print("    MTE/VDM display zero or counter-1; ISP/TSP display the counter directly.")
     print("    USSE slots: V=vertex, P=fragment, .=idle, S=service; slot 0 is printed first.")
     print("    Tile positions are progress markers in 16x16-pixel units, not fault locations.")
+    print("    Inactive/unknown fields are retained but excluded from comparisons.")
+    print("    Divergence is a snapshot difference, not proof of a stall or invalid submission.")
     print("    MEM_BLK matches are direct address overlaps; they do not prove GPU-MMU ownership.")
 
 
@@ -1349,6 +1395,8 @@ def _print_firmware_pipeline_summary(
     master = pipeline["master"]
     print("\nFIRMWARE_PIPELINE:")
     print(f"    Decoder               : {pipeline['decoder']}")
+    _print_render_state(pipeline)
+    _print_clipper_halt_check(pipeline, cores)
     print(
         "    Master                : "
         f"transfer={str(master['transfer_active']).lower()} "
@@ -1368,7 +1416,7 @@ def _print_firmware_pipeline_summary(
         diverged = [
             item["name"]
             for item in core["draw_counter_checks"] + core["tile_checks"]
-            if not item["aligned"]
+            if item["status"] == "diverged"
         ]
         progress = core["isp_progress"]
         bounds = core["render_bounds"]
@@ -1393,6 +1441,8 @@ def _compact_firmware_pipeline(pipeline: dict, cores: Sequence[int]) -> dict:
     return {
         "decoder": pipeline["decoder"],
         "master": pipeline["master"],
+        "render_state": pipeline["render_state"],
+        "clipper_halt_check": pipeline["clipper_halt_check"],
         "selected_cores": list(cores),
         "cores": [
             {
@@ -1487,18 +1537,18 @@ def _print_context_table(info: GpuInfo, diagnosis: dict) -> None:
             f"name={owner['process_name'] or '<unnamed>'}"
         )
     print("\nGPU_CONTEXT_ASSIGNMENTS:")
-    if not diagnosis["context_assignments"]:
-        print("    No context ID could be resolved consistently across the producer map.")
-    for assignment in diagnosis["context_assignments"]:
+    if not diagnosis["context_scope_assignments"]:
+        print("    No context ID could be resolved in a captured scope.")
+    for assignment in diagnosis["context_scope_assignments"]:
         owner = assignment["owner"]
         print(
-            f"    CID {assignment['context_id']} -> slot {owner['slot']} "
+            f"    {assignment['scope']:6} CID {assignment['context_id']} -> slot {owner['slot']} "
             f"{owner['process_name'] or '<unnamed>'} (map={assignment['status']})"
         )
     print("\nGPU_CONTEXT_MAP_RAW:")
     for index, row in enumerate(trailer.context_slot_map):
-        print(f"    Row {index}: " + " ".join(f"{value:02x}" for value in row))
-    print("    Values are owner-slot indices; ff means unused. Producer row roles remain unnamed.")
+        print(f"    Row {index} ({GPU_CONTEXT_MAP_SCOPES[index]:6}): " + " ".join(f"{value:02x}" for value in row))
+    print("    Values are owner-slot indices; ff means unused. Fault attribution uses only its scope's row.")
 
 
 def _print_capture_evidence(
@@ -2957,6 +3007,8 @@ def command_gpu(args: argparse.Namespace) -> int:
             "path": str(core.path),
             "context_owners": diagnosis["context_owners"],
             "context_assignments": diagnosis["context_assignments"],
+            "context_scope_assignments": diagnosis["context_scope_assignments"],
+            "context_slot_map_scopes": list(GPU_CONTEXT_MAP_SCOPES),
             "context_slot_map": [
                 list(row) for row in info.decoded_trailer().context_slot_map
             ],
@@ -3236,6 +3288,8 @@ def command_compare(args: argparse.Namespace) -> int:
         for section, output_key in postmortem_keys.items()
         if section in selected_sections
     }
+    if "contexts" in selected_sections:
+        postmortem_view["context_scope_assignment_changes"] = debug_comparison["context_scope_assignment_changes"]
     if args.summary_only:
         summarized = {}
         if "verdict" in selected_sections:
@@ -3251,11 +3305,15 @@ def command_compare(args: argparse.Namespace) -> int:
             summarized["context_assignment_change_count"] = len(
                 debug_comparison["context_assignment_changes"]
             )
+            changes = debug_comparison["context_scope_assignment_changes"]
+            summarized["context_scope_assignment_change_count"] = sum(len(items) for items in changes.values())
         if "pipeline" in selected_sections:
             value = debug_comparison["pipeline"]
             summarized["pipeline"] = {
                 "master_changed": value["master_changed"],
                 "core_change_count": len(value["core_changes"]),
+                "render_state_changed": value["render_state_changed"],
+                "clipper_halt_check_changed": value["clipper_halt_check_changed"],
             }
         if "resources" in selected_sections:
             value = debug_comparison["resource_pointers"]
@@ -3342,31 +3400,50 @@ def command_compare(args: argparse.Namespace) -> int:
     if "contexts" in selected_sections:
         context_changes = debug_comparison["context_assignment_changes"]
         print(f"Context assignment changes: {len(context_changes)}")
+        scoped = debug_comparison["context_scope_assignment_changes"]
+        print(f"Scoped context changes: +{len(scoped['added'])} -{len(scoped['removed'])} ~{len(scoped['changed'])}")
         if not args.summary_only:
+            def context_text(value: Optional[dict]) -> str:
+                if value is None:
+                    return "missing"
+                owner = value.get("owner")
+                if owner is None:
+                    return f"{value['status']} slots={value['candidate_slots']}"
+                return (
+                    f"slot{owner['slot']} {owner['process_name'] or '<unnamed>'} "
+                    f"pid={_hex(owner['process_id'])} ({value['status']})"
+                )
             for item in context_changes:
-                def context_text(value: Optional[dict]) -> str:
-                    if value is None:
-                        return "missing"
-                    owner = value.get("owner")
-                    if owner is None:
-                        return f"{value['status']} slots={value['candidate_slots']}"
-                    return (
-                        f"slot{owner['slot']} {owner['process_name'] or '<unnamed>'} "
-                        f"pid={_hex(owner['process_id'])} ({value['status']})"
-                    )
-
                 print(
                     f"  CID {item['context_id']}: {context_text(item['left'])} -> "
                     f"{context_text(item['right'])}"
                 )
+            for sign, items in (("+", scoped["added"]), ("-", scoped["removed"])):
+                for item in items:
+                    print(f"  {sign} {item['scope']} CID {item['context_id']}: {context_text(item)}")
+            for change in scoped["changed"]:
+                key = change["key"]
+                print(f"  {key['scope']} CID {key['context_id']}: {context_text(change['left'])} -> {context_text(change['right'])}")
     if "pipeline" in selected_sections:
         pipeline_change = debug_comparison["pipeline"]
         print(
             "Pipeline changes: "
             f"master={str(pipeline_change['master_changed']).lower()} "
-            f"cores={len(pipeline_change['core_changes'])}"
+            f"cores={len(pipeline_change['core_changes'])} "
+            f"frame/scene={str(pipeline_change['render_state_changed']).lower()} "
+            f"clipper-signature={str(pipeline_change['clipper_halt_check_changed']).lower()}"
         )
         if not args.summary_only:
+            if pipeline_change["render_state_changed"]:
+                old_state = pipeline_change["left_render_state"]
+                new_state = pipeline_change["right_render_state"]
+                if old_state["available"] != new_state["available"]:
+                    print(f"  frame/scene available: {old_state['available']} -> {new_state['available']}")
+                for name in GPU_RENDER_STATE_FIELDS:
+                    if old_state[name] != new_state[name]:
+                        print(f"  {name}: {old_state[name]} -> {new_state[name]}")
+            if pipeline_change["clipper_halt_check_changed"]:
+                print(f"  clipper signature: {pipeline_change['left_clipper_halt_check']['status']} -> {pipeline_change['right_clipper_halt_check']['status']}")
             if pipeline_change["master_changed"]:
                 print(
                     f"  master: {pipeline_change['left_master']} -> "
@@ -3379,11 +3456,15 @@ def command_compare(args: argparse.Namespace) -> int:
                 for key, label in (
                     ("active_phases", "phases"),
                     ("active_units", "units"),
+                    ("usse_data_master_usage", "usse-usage"),
                     ("draw_counters", "draw-counters"),
+                    ("draw_counter_applicability", "draw-applicability"),
                     ("isp_progress", "isp-progress"),
                     ("render_bounds", "render-bounds"),
                     ("region_header_base", "region-headers"),
                     ("tile_progress", "tile-progress"),
+                    ("tile_applicability", "tile-applicability"),
+                    ("zls", "depth/stencil"),
                 ):
                     if left_core.get(key) != right_core.get(key):
                         print(
@@ -3520,7 +3601,7 @@ def command_compare(args: argparse.Namespace) -> int:
                 print(f"  slot{item['slot']}: {old_text} -> {new_text}")
         print(
             f"Context-slot map changed: {int(comparison['context_slot_map_changed'])}; "
-            f"driver-state words changed: {len(comparison['driver_state_changes'])}"
+            f"frame/scene words changed: {len(comparison['driver_state_changes'])}"
         )
     else:
         counts = gpu_summary["change_counts"]

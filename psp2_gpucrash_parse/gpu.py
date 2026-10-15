@@ -17,6 +17,10 @@ GPU_REGISTER_DUMP_INITIALIZED_SIZE = 0x3130
 GPU_REGISTER_DUMP_EXPORT_SIZE = 0x3400
 GPU_INFO_OUTER_FORMAT_WORD_SIZE = 4
 GPU_DRIVER_STATE_OBJECT_OFFSETS = (0x108, 0x10C, 0x110, 0x114)
+GPU_RENDER_STATE_FIELDS = (
+    "vertex_frame", "fragment_frame", "vertex_scene", "fragment_scene",
+)
+GPU_CONTEXT_MAP_SCOPES = ("core0", "core1", "core2", "core3", "master")
 
 _CAPTURE_SECTIONS = (
     (0x01, "master_registers"),
@@ -179,6 +183,41 @@ class GpuTrailer:
             offset = 0xF8
         return cls(owners, slot_map, state, offset, data[offset:], data)
 
+    def context_attribution(self, context_id: int, scope: Optional[str] = None) -> dict:
+        """Resolve one scope's directory context; no scope requests an aggregate view."""
+        result = {
+            "status": "unavailable", "candidate_slots": [], "owner": None,
+            "scope": scope, "map_row": None,
+        }
+        if not 0 <= context_id < 8:
+            return {**result, "status": "out-of-range"}
+        rows = self.context_slot_map
+        if scope is not None:
+            if scope not in GPU_CONTEXT_MAP_SCOPES:
+                return {**result, "status": "out-of-range"}
+            row = GPU_CONTEXT_MAP_SCOPES.index(scope)
+            result["map_row"] = row
+            rows = rows[row:row + 1]
+        if not rows or any(context_id >= len(row) for row in rows):
+            return result
+        mapped = [row[context_id] for row in rows]
+        candidates = sorted(set(mapped) - {0xFF})
+        status = "consistent" if candidates else "unassigned"
+        if len(candidates) > 1:
+            status = "ambiguous"
+        elif candidates and 0xFF in mapped:
+            status = "partial"
+        owner = None
+        if len(candidates) == 1:
+            slot = candidates[0]
+            if slot >= len(self.context_owners):
+                status = "invalid-slot"
+            elif self.context_owners[slot].populated:
+                owner = self.context_owners[slot].summary()
+            else:
+                status = "unassigned"
+        return {**result, "status": status, "candidate_slots": candidates, "owner": owner}
+
     def summary(self) -> dict:
         expected_padding_size = (
             GPU_REGISTER_DUMP_EXPORT_SIZE - GPU_REGISTER_DUMP_INITIALIZED_SIZE
@@ -187,6 +226,7 @@ class GpuTrailer:
             {
                 "word": index,
                 "source_object_offset": GPU_DRIVER_STATE_OBJECT_OFFSETS[index],
+                "name": GPU_RENDER_STATE_FIELDS[index],
                 "value": value,
             }
             for index, value in enumerate(self.driver_state_words)
@@ -196,12 +236,13 @@ class GpuTrailer:
             "sha256": hashlib.sha256(self.raw).hexdigest(),
             "context_owners": [owner.summary() for owner in self.context_owners],
             "context_slot_map": [list(row) for row in self.context_slot_map],
+            "context_slot_map_scopes": list(GPU_CONTEXT_MAP_SCOPES[:len(self.context_slot_map)]),
             "driver_state_words": list(self.driver_state_words),
             "driver_state": driver_state,
             "driver_state_provenance": (
-                "Words copied by the GPU_INFO producer from GPU driver object "
-                "offsets +0x108, +0x10c, +0x110, and +0x114; field semantics "
-                "are not established."
+                "SGXMKIF_TA3D_CTL renderState[4] at offsets +0x108, +0x10c, "
+                "+0x110, and +0x114: vertex/fragment frame, vertex/fragment scene. "
+                "Interpretation requires GPU_INFO capture flag 0x10."
             ),
             "producer_initialized_size": GPU_REGISTER_DUMP_INITIALIZED_SIZE,
             "producer_export_size": GPU_REGISTER_DUMP_EXPORT_SIZE,
@@ -350,6 +391,29 @@ class GpuInfo:
             for mask, name in _CAPTURE_SECTIONS
         }
 
+    def render_state(self) -> dict:
+        words = self.decoded_trailer().driver_state_words
+        available = bool(self.capture_flags & 0x10) and len(words) == 4
+        return {
+            "available": available,
+            "capture_flag_set": bool(self.capture_flags & 0x10),
+            "raw_words": list(words),
+            **{name: words[index] if available else None
+               for index, name in enumerate(GPU_RENDER_STATE_FIELDS)},
+            "qualification": (
+                "Retained TA/3D frame and scene counters, not completion fences or "
+                "application frame ownership. Differences alone do not establish a stall."
+            ),
+        }
+
+    def context_attribution(self, context_id: int, scope: Optional[str] = None) -> dict:
+        result = self.decoded_trailer().context_attribution(context_id, scope)
+        if scope in GPU_CONTEXT_MAP_SCOPES[:4] and int(scope[4:]) >= self.core_count:
+            result.update(status="out-of-range", candidate_slots=[], owner=None)
+        if not self.capture_flags & 0x08:
+            result.update(status="unavailable", candidate_slots=[], owner=None)
+        return result
+
     def snapshot_status(self) -> dict:
         missing = [name for name, captured in self.capture_sections().items() if not captured]
         unknown_flags = self.capture_flags & ~GPU_INFO_KNOWN_CAPTURE_FLAGS
@@ -434,6 +498,7 @@ class GpuInfo:
             "producer_words": list(self.header_words[3:11]),
             "capture_timestamp": self.capture_timestamp(),
             "hardware_clock_state": self.hardware_clock_state(),
+            "render_state": self.render_state(),
             "core_count": self.core_count,
             "master_register_count": len(self.master_registers),
             "per_core_register_count": len(self.per_core_registers),
@@ -443,7 +508,7 @@ class GpuInfo:
                 "unassigned_rows": len(self.indexed_state) - len(interpreted_selectors),
                 "consumer_interpreted_selectors": interpreted_selectors,
                 "qualification": (
-                    "Only selectors used by the firmware coredump formatter are "
+                    "Only selectors used by firmware coredump or register-dump analysis are "
                     "named; remaining captured rows are retained without speculative labels."
                 ),
             },
@@ -621,7 +686,10 @@ def compare_gpu_info(left: GpuInfo, right: GpuInfo, database: RegisterDatabase) 
             else None
         )
         if old != new:
-            driver_state_changes.append({"word": index, "left": old, "right": new})
+            driver_state_changes.append({
+                "word": index, "name": GPU_RENDER_STATE_FIELDS[index],
+                "left": old, "right": new,
+            })
     return {
         "header_changes": [
             {"word": index, "left": old, "right": new}

@@ -30,10 +30,12 @@ def _pipeline_components(diagnosis: dict) -> dict:
                 "draw_counters": {
                     item["code"]: item["draw_number"]
                     for item in core["draw_counters"]
+                    if item["applicability"] == "active"
                 },
                 "tile_progress": {
                     item["code"]: [item["tile_x"], item["tile_y"]]
                     for item in core["tile_progress"]
+                    if item["applicability"] == "active"
                 },
             }
             for core in pipeline["cores"]
@@ -196,7 +198,7 @@ def triage_dumps(paths: Sequence[Path], database: RegisterDatabase) -> dict:
         "signature_notes": {
             "failure": "Classification, exact fault pages, requestors, conditions, page-access types, contexts, scopes, lockup phases, and event codes.",
             "failure_pattern": "Failure signature with fault pages omitted for address-independent grouping.",
-            "pipeline": "Decoded firmware master/core phase, unit, draw, and tile state.",
+            "pipeline": "Decoded firmware master/core phase and unit state, with applicable draw/tile progress only.",
             "register": "GPU register and indexed tables; capture timestamp and context-owner trailer are excluded.",
         },
     }

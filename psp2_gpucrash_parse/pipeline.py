@@ -117,12 +117,24 @@ def _zls_state(info: GpuInfo, core_index: int) -> Optional[dict]:
     external = bool(control & 0x00100000)
     extent = (control & 0x000007F8) >> 3
     flags = [name for mask, name in _ZLS_FLAGS if control & mask]
+    aa = _core_value(info, 0x042C, core_index)
+    mode = aa & 3 if aa is not None else None
+    samples = (1, 2, 4, None)[mode] if mode is not None else None
+    width_samples = (extent + 1) * 32 if external else None
+    # PrintSamples divides the horizontal sample extent by two for 4x MSAA.
+    # A missing/invalid AA mode cannot establish a width in pixels.
     return {
         "control": control,
         "flags": flags,
         "external_depth_buffer": external,
         "extent_field": extent,
-        "width_pixels": (extent + 1) * 32 if external else None,
+        "width_samples": width_samples,
+        "width_pixels": width_samples // (2 if samples == 4 else 1)
+        if width_samples is not None and samples is not None else None,
+        "msaa": {
+            "register_value": aa, "mode_bits": mode, "samples": samples,
+            "mode": ("1x", "2x", "4x", "reserved")[mode] if mode is not None else "unknown",
+        },
         "depth_load_format": (control >> 21) & 0x7,
         "depth_store_format": (control >> 24) & 0x7,
         "surfaces": {
@@ -168,6 +180,81 @@ def _usse_data_master_usage(info: GpuInfo, core_index: int) -> List[dict]:
     return pipes
 
 
+def _applicability(value: Optional[bool]) -> str:
+    return "unknown" if value is None else "active" if value else "inactive"
+
+
+def _all_active(*values: Optional[bool]) -> Optional[bool]:
+    if False in values:
+        return False
+    return None if None in values else True
+
+
+def _progress_check(code: str, name: str, fields: List[dict], value_key: str) -> dict:
+    retained = {item["code"]: item[value_key] for item in fields}
+    values = {
+        item["code"]: item[value_key] for item in fields
+        if item["applicability"] == "active"
+    }
+    comparable = len(values) >= 2
+    aligned = len(set(values.values())) == 1 if comparable else None
+    return {
+        "code": code, "name": name, "values": values,
+        "retained_values": retained,
+        "excluded": {item["code"]: item["applicability"] for item in fields
+                     if item["applicability"] != "active"},
+        "basis": "applicable retained fields",
+        "status": "not-comparable" if not comparable else "aligned" if aligned else "diverged",
+        "aligned": aligned,
+    }
+
+
+def _clipper_halt_check(info: GpuInfo, table: Dict[int, Tuple[int, ...]]) -> dict:
+    """Mirror the native no-BIF-fault signature; this is not a root-cause test."""
+    result = {"status": "unavailable", "matches": []}
+    master = info.master_value(0x4C04)
+    cores = info.core_values(0x0C04)
+    if (
+        (info.capture_flags & 7) != 7 or master is None
+        or cores is None or len(cores) < info.core_count
+    ):
+        return result
+    # The driver's recovery decision tests all three raw hardware type bits,
+    # including directory access. Do not substitute normalized condition bits.
+    if master & 0x70000 or any(value & 0x70000 for value in cores[:info.core_count]):
+        return {**result, "status": "bif-fault-present"}
+    for core in range(info.core_count):
+        value = _indexed_value(table, 0x25, core)
+        if value is None:
+            return result
+        if not value & 0x10:
+            continue
+        counter = _indexed_value(table, 0x26, core)
+        counter = counter & 0x1FFF if counter is not None else None
+        bank_set = _core_value(info, 0x0C74, core)
+        bank_offset = None
+        if bank_set is not None:
+            bank_offset = 0x0C7C if ((bank_set >> 6) & 3) == 3 else 0x0C78
+        bank_value = _core_value(info, bank_offset, core) if bank_offset is not None else None
+        return {
+            "status": "matched",
+            "matches": [{
+                "code": "possible-clipper-halt", "scope": f"core{core}",
+                "selector": 0x25, "raw_value": value, "mask": 0x10,
+                "firmware_analysis_code": 4,
+                "draw_counter": counter,
+                "draw_number": max(0, counter - 1) if counter is not None else None,
+                "bank_set_raw": bank_set, "bank_offset": bank_offset, "bank_value": bank_value,
+                "context_id": (bank_value >> 4) & 0xF if bank_value is not None else None,
+                "qualification": (
+                    "Matches the firmware's possible known clipper-hardware-bug halt signature. "
+                    "Not a confirmed hardware defect or proof that submitted data was valid."
+                ),
+            }],
+        }
+    return {**result, "status": "not-matched"}
+
+
 def _core_pipeline(
     info: GpuInfo, table: Dict[int, Tuple[int, ...]], core_index: int
 ) -> dict:
@@ -188,6 +275,19 @@ def _core_pipeline(
             if not unit_value & mask
         ]
 
+    usage = _usse_data_master_usage(info, core_index)
+    pipe_counts = {pipe["pipe"]: pipe["counts"] for pipe in usage}
+    vertex = bool(phase_value & 1) if phase_value is not None else None
+    fragment = bool(phase_value & 2) if phase_value is not None else None
+
+    def pipe_active(pipe: int, phase: str) -> Optional[bool]:
+        return bool(pipe_counts[pipe][phase]) if pipe in pipe_counts else None
+
+    def unit_active(*codes: str) -> Optional[bool]:
+        if unit_value is None:
+            return None
+        return any(item["code"] in codes for item in active_units)
+
     draw_counters = []
     for selector, code, name, mask, shift in _DRAW_SELECTORS:
         value = _indexed_value(table, selector, core_index)
@@ -196,6 +296,12 @@ def _core_pipeline(
             # MTE/VDM use PrintDrawNumber (zero or count - 1); ISP/TSP use
             # PrintUnsigned directly. Preserve both the field and display.
             biased = code == "mte" or code.startswith("vdm-pipe-")
+            if code == "mte":
+                active = vertex
+            elif code.startswith("vdm-pipe-"):
+                active = pipe_active(int(code[-1]), "vertex")
+            else:
+                active = fragment
             draw_counters.append(
                 {
                     "code": code,
@@ -206,12 +312,10 @@ def _core_pipeline(
                     "draw_number": max(0, counter - 1) if biased else counter,
                     "encoding": "zero-or-draw-plus-one" if biased else "draw-number",
                     "counter_mask": mask >> shift,
+                    "applicability": _applicability(active),
                 }
             )
 
-    counter_by_code = {
-        item["code"]: item["counter_value"] for item in draw_counters
-    }
     counter_checks = []
     for code, name, members in (
         (
@@ -225,42 +329,40 @@ def _core_pipeline(
             ("isp-output", "tsp-parameter-fetch"),
         ),
     ):
-        values = {
-            member: counter_by_code[member]
-            for member in members
-            if member in counter_by_code
-        }
-        if values:
-            counter_checks.append(
-                {
-                    "code": code,
-                    "name": name,
-                    "values": values,
-                    "basis": "raw counter fields",
-                    "aligned": len(set(values.values())) == 1,
-                }
-            )
+        fields = [item for item in draw_counters if item["code"] in members]
+        if fields:
+            check = _progress_check(code, name, fields, "counter_value")
+            check["basis"] = "applicable raw counter fields"
+            counter_checks.append(check)
 
     tiles = []
+    tile_activity = {
+        "pds": _all_active(fragment, unit_active("pds")),
+        "isp-input": unit_active("isp", "isp-parameter-fetch"),
+        "isp-output": unit_active("isp", "isp-parameter-fetch"),
+        "tsp-parameter-fetch": unit_active("tsp"),
+        "color-output": unit_active("pbe"),
+    }
     for selector, code, name, swapped in _TILE_SELECTORS:
         value = _indexed_value(table, selector, core_index)
         if value is not None:
-            tiles.append(_tile(selector, code, name, value, swapped))
+            active = (
+                pipe_active(int(code[-1]), "fragment")
+                if code.startswith("usse-pipe-") else tile_activity[code]
+            )
+            tiles.append({**_tile(selector, code, name, value, swapped),
+                          "applicability": _applicability(active)})
     usse_tiles = [
-        (item["tile_x"], item["tile_y"])
-        for item in tiles
-        if item["code"].startswith("usse-pipe-")
+        {**item, "coordinate": (item["tile_x"], item["tile_y"])}
+        for item in tiles if item["code"].startswith("usse-pipe-")
     ]
     tile_checks = []
     if usse_tiles:
-        tile_checks.append(
-            {
-                "code": "usse-pipe-tiles",
-                "name": "USSE pipe tile positions",
-                "values": [list(value) for value in usse_tiles],
-                "aligned": len(set(usse_tiles)) == 1,
-            }
-        )
+        check = _progress_check("usse-pipe-tiles", "USSE pipe tile positions", usse_tiles, "coordinate")
+        check["members"] = list(check["values"])
+        check["values"] = [list(value) for value in check["values"].values()]
+        check["retained_values"] = {code: list(value) for code, value in check["retained_values"].items()}
+        tile_checks.append(check)
 
     screen = _core_value(info, 0x0248, core_index)
     render_bounds = None
@@ -296,7 +398,7 @@ def _core_pipeline(
         "unit_selector": 0x02,
         "unit_value": unit_value,
         "active_units": active_units,
-        "usse_data_master_usage": _usse_data_master_usage(info, core_index),
+        "usse_data_master_usage": usage,
         "draw_counters": draw_counters,
         "draw_counter_checks": counter_checks,
         "tile_progress": tiles,
@@ -320,6 +422,8 @@ def firmware_pipeline_diagnosis(info: GpuInfo) -> dict:
     active_cores = [item["core"] for item in cores if item["active_phases"]]
     return {
         "decoder": "ES4 firmware diagnostic tables (3.68 reference module)",
+        "render_state": info.render_state(),
+        "clipper_halt_check": _clipper_halt_check(info, table),
         "indexed_selectors_present": sorted(table),
         "active_core_count": len(active_cores),
         "active_cores": active_cores,
@@ -346,5 +450,7 @@ def firmware_pipeline_diagnosis(info: GpuInfo) -> dict:
             "Tile coordinates are hardware progress positions; each tile is 16x16 pixels.",
             "USSE slots are data-master tags, not shader instructions or instruction addresses.",
             "Active-unit bits are low-active in indexed selector 2.",
+            "Inactive or unqualified progress fields remain retained but are excluded from comparisons.",
+            "Counter/tile divergence is a snapshot difference, not a required invariant or a proven stall.",
         ],
     }

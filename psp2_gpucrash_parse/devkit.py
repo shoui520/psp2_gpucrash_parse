@@ -14,7 +14,7 @@ from typing import List, Optional
 
 from ._des import decrypt_cbc
 from .core import CoreDump, ParseError
-from .gpu import GpuInfo, MasterRegister, PerCoreRegister
+from .gpu import GPU_RENDER_STATE_FIELDS, GpuInfo, MasterRegister, PerCoreRegister
 from .indexed import indexed_selector_metadata
 from .pipeline import firmware_pipeline_diagnosis
 from .registers import RegisterDatabase, decoded_fields
@@ -263,6 +263,12 @@ class DevkitGpuDump:
         text = _clean_text(self.text_bytes)
         pipeline = firmware_pipeline_diagnosis(state)
         pipeline["decoder"] = "SceGpuEs4CoreDump ES4 diagnostic tables"
+        if self.render_state is not None:
+            pipeline["render_state"].update({
+                **self.render_state, "available": True, "capture_flag_set": None,
+                "source": "native render-state segment",
+                "raw_words": [self.render_state[name] for name in GPU_RENDER_STATE_FIELDS],
+            })
         return {
             "path": str(self.path), "size": len(self.data),
             "sha256": hashlib.sha256(self.data).hexdigest(),
@@ -364,25 +370,19 @@ def correlate_gpu_dump(native: DevkitGpuDump, core: CoreDump, info: GpuInfo) -> 
         if fault is None:
             continue
         context = fault["context_id"]
-        slots = {
-            row[context] for row in trailer.context_slot_map
-            if context < len(row) and row[context] != 0xFF
-        }
-        owner = None
-        if len(slots) == 1:
-            slot = next(iter(slots))
-            if slot < len(trailer.context_owners) and trailer.context_owners[slot].populated:
-                owner = trailer.context_owners[slot]
+        attribution = info.context_attribution(context, process["scope"])
+        owner = attribution["owner"]
         check = "unresolved"
         if owner is not None:
-            check = "match" if owner.process_id == process["process_id"] and _owner_name_match(
-                owner.process_name, process["process_name"]
+            check = "match" if owner["process_id"] == process["process_id"] and _owner_name_match(
+                owner["process_name"], process["process_name"]
             ) else "mismatch"
         fault_process_checks.append({
             "scope": process["scope"], "context_id": context, "status": check,
             "gpu_dump_pid": process["process_id"], "gpu_dump_name": process["process_name"],
-            "gpu_info_pid": owner.process_id if owner else None,
-            "gpu_info_name": owner.process_name if owner else None,
+            "gpu_info_pid": owner["process_id"] if owner else None,
+            "gpu_info_name": owner["process_name"] if owner else None,
+            "context_attribution": attribution,
         })
     soc_matches = native.header["soc_revision"] == info.hardware_clock_state()["soc_revision"]
     comparisons = {

@@ -3,9 +3,9 @@ from __future__ import annotations
 from typing import Optional
 
 
-# Selectors consumed by the firmware 3.68 ES4 coredump formatter.  The GPU
-# producer captures a fixed table of 109 selectors through 0x7a; the formatter
-# assigns semantics only to this subset.  Unlisted selectors deliberately
+# Selectors consumed by the firmware 3.68 ES4 coredump formatter and native
+# register-dump analysis. The GPU producer captures 109 selectors through 0x7a;
+# these consumers assign semantics only to this subset. Unlisted selectors
 # remain unnamed rather than inheriting speculative SGX debug-register labels.
 INDEXED_SELECTOR_METADATA = {
     0x00: {
@@ -42,6 +42,11 @@ INDEXED_SELECTOR_METADATA = {
         "name": "VDM pipe 3 draw number",
         "roles": ["draw-counter"],
         "description": "VDM pipe 3 draw counter.",
+    },
+    0x25: {
+        "name": "clipper halt signature",
+        "roles": ["halt-signature"],
+        "description": "Bit 4 is the firmware's possible clipper-halt signature when no BIF fault is present.",
     },
     0x26: {
         "name": "MTE draw number",

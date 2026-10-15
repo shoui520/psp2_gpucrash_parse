@@ -8,7 +8,7 @@ from typing import List, Optional, Sequence, Tuple
 from .activity import GpuActivityInfo
 from .core import CoreDump, ParseError
 from .execution import ExecutionContext
-from .gpu import GpuInfo, GpuTrailer
+from .gpu import GPU_CONTEXT_MAP_SCOPES, GpuInfo, GpuTrailer
 from .kernel import KernelObjectRegistry
 from .metadata import SummaryInfo
 from .pipeline import firmware_pipeline_diagnosis
@@ -135,23 +135,8 @@ _STRUCTURED_NOTE_NAMES = {
 
 
 def _owner_for_context(trailer: GpuTrailer, context_id: int) -> dict:
-    if not trailer.context_slot_map or context_id < 0:
-        return {"status": "unavailable", "candidate_slots": [], "owner": None}
-    if any(context_id >= len(row) for row in trailer.context_slot_map):
-        return {"status": "out-of-range", "candidate_slots": [], "owner": None}
-    mapped = [row[context_id] for row in trailer.context_slot_map]
-    candidates = sorted({slot for slot in mapped if slot != 0xFF})
-    status = "consistent" if len(set(mapped)) == 1 and candidates else "unassigned"
-    if len(candidates) > 1:
-        status = "ambiguous"
-    elif candidates and any(slot == 0xFF for slot in mapped):
-        status = "partial"
-    owner = None
-    if len(candidates) == 1 and candidates[0] < len(trailer.context_owners):
-        candidate = trailer.context_owners[candidates[0]]
-        if candidate.populated:
-            owner = candidate.summary()
-    return {"status": status, "candidate_slots": candidates, "owner": owner}
+    # Compatibility aggregate view only. Faults resolve a specific scope.
+    return trailer.context_attribution(context_id)
 
 
 def _context_assignments(trailer: GpuTrailer) -> List[dict]:
@@ -303,11 +288,10 @@ def _enrich_pipeline_addresses(core: CoreDump, pipeline: dict) -> None:
 def _fault_evidence(
     core: CoreDump, info: GpuInfo, database: RegisterDatabase
 ) -> List[dict]:
-    trailer = info.decoded_trailer()
     result = []
     for source in info.bif_diagnosis()["fault_sources"]:
         item = dict(source)
-        context = _owner_for_context(trailer, source["context_id"])
+        context = info.context_attribution(source["context_id"], source["scope"])
         directory_base = _directory_base(info, source["scope"], source["context_id"])
         item.update(
             {
@@ -781,7 +765,19 @@ def _verdict(
     fault_groups: List[dict],
     signals: List[dict],
     lockup_phases: List[dict],
+    firmware_signatures: List[dict],
 ) -> Tuple[str, str, str, str]:
+    if firmware_signatures:
+        scopes = ", ".join(item["scope"] for item in firmware_signatures)
+        return (
+            "gpu-clipper-halt-signature",
+            "medium",
+            f"GPU halt matches the firmware's possible clipper-hardware-bug signature: {scopes}",
+            "Indexed selector 0x25 bit 4 is set with no BIF fault-type latch. The native "
+            "driver selects its possible known clipper-hardware-bug recovery path for this "
+            "state. This identifies a firmware signature, not a confirmed hardware defect; "
+            "submitted command and shader data remain unverified.",
+        )
     if faults:
         active_faults = [fault for fault in faults if fault["status_latched"]]
         scopes = ", ".join(item["scope"] for item in faults)
@@ -954,8 +950,14 @@ def build_diagnosis(
     pipeline_markers = _pipeline_markers(info)
     pipeline = firmware_pipeline_diagnosis(info)
     _enrich_pipeline_addresses(core, pipeline)
+    firmware_signatures = pipeline["clipper_halt_check"]["matches"]
+    for signature in firmware_signatures:
+        cid = signature["context_id"]
+        signature["context_attribution"] = info.context_attribution(
+            cid if cid is not None else -1, signature["scope"]
+        )
     classification, confidence, headline, explanation = _verdict(
-        faults, fault_groups, signals, lockup_phases
+        faults, fault_groups, signals, lockup_phases, firmware_signatures
     )
     root_cause_confidence = _root_cause_confidence(classification)
     failure_bucket, failure_hash = _failure_identity(
@@ -1019,13 +1021,20 @@ def build_diagnosis(
         "lockup_phases": lockup_phases,
         "pipeline_markers": pipeline_markers,
         "firmware_pipeline": pipeline,
+        "firmware_signatures": firmware_signatures,
         "snapshot": info.snapshot_status(),
         "context_owners": [
             owner.summary()
             for owner in trailer.context_owners
             if owner.populated
         ],
-        "context_assignments": _context_assignments(trailer),
+        "context_assignments": _context_assignments(trailer) if info.capture_flags & 8 else [],
+        "context_scope_assignments": [
+            {"context_id": cid, **attribution}
+            for scope in (*GPU_CONTEXT_MAP_SCOPES[:min(info.core_count, 4)], "master")
+            for cid in range(8)
+            if (attribution := info.context_attribution(cid, scope))["owner"] is not None
+        ],
         "memory_evidence": memory,
         "note_coverage": _note_coverage(core),
         "allocation_evidence": allocations,
